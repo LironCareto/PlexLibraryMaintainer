@@ -15,6 +15,7 @@ import os
 import sqlite3
 import sys
 import unicodedata
+from datetime import datetime
 from difflib import SequenceMatcher
 from collections import defaultdict
 from dataclasses import dataclass
@@ -226,6 +227,43 @@ def suspicious_title_match(plan: FolderPlan):
         return None
 
     return score
+
+
+def create_rename_log():
+    """Create a per-run JSON-lines audit log before any filesystem mutation."""
+    log_dir = Path("logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    log_path = log_dir / f"rename-{timestamp}.log"
+    handle = log_path.open("x", encoding="utf-8")
+
+    header = {
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "status": "START",
+        "tool": "PlexLibraryMaintainer",
+        "mode": "write",
+    }
+    handle.write(json.dumps(header, ensure_ascii=False) + "\n")
+    handle.flush()
+    return log_path, handle
+
+
+def write_rename_log(handle, status: str, plan: FolderPlan, error=None):
+    record = {
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "status": status,
+        "source": str(plan.source),
+        "target": str(plan.target),
+        "library": plan.library_name,
+        "title": plan.title,
+        "year": plan.year,
+    }
+    if error is not None:
+        record["error"] = str(error)
+
+    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    handle.flush()
 
 
 def split_suspicious_plans(
@@ -705,24 +743,42 @@ def main() -> int:
 
     renamed = 0
     errors = 0
+    rename_log_path = None
+    rename_log_handle = None
 
     if args.write:
-        # Deepest paths first, so a parent rename cannot invalidate a child source path.
-        for plan in sorted(
-            actionable,
-            key=lambda item: len(item.source.parts),
-            reverse=True,
-        ):
-            try:
-                os.rename(plan.source, plan.target)
-                renamed += 1
-                print(f"[RENAMED] {plan.source} -> {plan.target}")
-            except OSError as exc:
-                errors += 1
-                print(
-                    f"[ERROR] Could not rename {plan.source} -> {plan.target}: {exc}",
-                    file=sys.stderr,
-                )
+        try:
+            rename_log_path, rename_log_handle = create_rename_log()
+        except OSError as exc:
+            print(
+                f"[FATAL] Could not create rename audit log; refusing to write: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+
+        print(f"Rename audit log: {rename_log_path}")
+
+        try:
+            # Deepest paths first, so a parent rename cannot invalidate a child source path.
+            for plan in sorted(
+                actionable,
+                key=lambda item: len(item.source.parts),
+                reverse=True,
+            ):
+                try:
+                    os.rename(plan.source, plan.target)
+                    renamed += 1
+                    write_rename_log(rename_log_handle, "RENAMED", plan)
+                    print(f"[RENAMED] {plan.source} -> {plan.target}")
+                except OSError as exc:
+                    errors += 1
+                    write_rename_log(rename_log_handle, "ERROR", plan, error=exc)
+                    print(
+                        f"[ERROR] Could not rename {plan.source} -> {plan.target}: {exc}",
+                        file=sys.stderr,
+                    )
+        finally:
+            rename_log_handle.close()
 
     print()
     print("Summary")
@@ -737,6 +793,8 @@ def main() -> int:
     print(f"Needs review        : {len(review)}")
     print(f"Collision groups    : {len(collision_reports)}")
     print(f"Errors              : {errors}")
+    if rename_log_path is not None:
+        print(f"Rename audit log    : {rename_log_path}")
 
     if not args.write:
         print("\nDRY RUN ONLY. Nothing was renamed. Add --write to apply folder renames.")
