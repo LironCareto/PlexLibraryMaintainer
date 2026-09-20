@@ -250,13 +250,14 @@ def build_plans(
     conn: sqlite3.Connection,
     libraries: list[Library],
     path_maps: list[tuple[str, str]],
-) -> tuple[list[FolderPlan], list[str], int]:
+) -> tuple[list[FolderPlan], list[str], list[str], int]:
     library_by_id = {library.id: library for library in libraries}
     roots = library_root_paths(conn, list(library_by_id), path_maps)
 
     folder_metadata: dict[Path, set[tuple[str, int, int]]] = defaultdict(set)
     skipped = 0
     review: list[str] = []
+    no_folder: list[str] = []
 
     for row in movie_rows(conn, list(library_by_id)):
         title = row["title"]
@@ -285,7 +286,7 @@ def build_plans(
 
         if source is None:
             skipped += 1
-            review.append(
+            no_folder.append(
                 f"[NO FOLDER] {file_path}: movie file is directly in the library "
                 "root; skipped in M1"
             )
@@ -320,31 +321,44 @@ def build_plans(
             )
         )
 
-    return plans, review, skipped
+    return plans, review, no_folder, skipped
 
 
 def validate_plans(
     plans: list[FolderPlan],
-) -> tuple[list[FolderPlan], list[str], int, int]:
+) -> tuple[list[FolderPlan], list[str], list[str], int]:
     actionable: list[FolderPlan] = []
     review: list[str] = []
+    collision_reports: list[str] = []
     already_normalized = 0
-    collisions = 0
 
     destination_sources: dict[Path, list[Path]] = defaultdict(list)
     for plan in plans:
         destination_sources[plan.target].append(plan.source)
+
+    # A collision is reported once per destination, with every source shown.
+    multi_source_targets = {
+        target
+        for target, sources in destination_sources.items()
+        if len(sources) > 1
+    }
+
+    for target in sorted(multi_source_targets, key=str):
+        sources = sorted(destination_sources[target], key=str)
+        lines = [f"[COLLISION] target: {target}"]
+        lines.extend(f"  source: {source}" for source in sources)
+        collision_reports.append("\n".join(lines))
+
+    # Track single-source destinations that already exist. These are also one
+    # collision group each, but are distinct from duplicate Plex destinations.
+    existing_target_collisions: dict[Path, list[Path]] = defaultdict(list)
 
     for plan in plans:
         if plan.source == plan.target:
             already_normalized += 1
             continue
 
-        if len(destination_sources[plan.target]) > 1:
-            collisions += 1
-            review.append(
-                f"[COLLISION] multiple source folders target {plan.target}"
-            )
+        if plan.target in multi_source_targets:
             continue
 
         if not plan.source.exists():
@@ -360,15 +374,18 @@ def validate_plans(
             continue
 
         if plan.target.exists():
-            collisions += 1
-            review.append(
-                f"[COLLISION] destination already exists: {plan.target}"
-            )
+            existing_target_collisions[plan.target].append(plan.source)
             continue
 
         actionable.append(plan)
 
-    return actionable, review, already_normalized, collisions
+    for target in sorted(existing_target_collisions, key=str):
+        sources = sorted(existing_target_collisions[target], key=str)
+        lines = [f"[COLLISION] destination already exists: {target}"]
+        lines.extend(f"  source: {source}" for source in sources)
+        collision_reports.append("\n".join(lines))
+
+    return actionable, review, collision_reports, already_normalized
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -494,7 +511,7 @@ def main() -> int:
                 print(f"[FATAL] {error}", file=sys.stderr)
             return 2
 
-        plans, build_review, build_skipped = build_plans(
+        plans, build_review, no_folder, build_skipped = build_plans(
             conn,
             libraries,
             path_maps,
@@ -505,7 +522,7 @@ def main() -> int:
     finally:
         conn.close()
 
-    actionable, validation_review, already_normalized, collisions = validate_plans(plans)
+    actionable, validation_review, collision_reports, already_normalized = validate_plans(plans)
     review = build_review + validation_review
 
     print("PlexLibraryMaintainer")
@@ -523,8 +540,14 @@ def main() -> int:
             print("         [DRY RUN: not renamed]")
         print()
 
+    for line in no_folder:
+        print(line)
+
     for line in review:
         print(line)
+
+    for report in collision_reports:
+        print(report)
 
     renamed = 0
     errors = 0
@@ -554,8 +577,9 @@ def main() -> int:
     print(f"Already normalized  : {already_normalized}")
     print(f"Would rename        : {len(actionable) if not args.write else 0}")
     print(f"Renamed             : {renamed}")
+    print(f"No folder           : {len(no_folder)}")
     print(f"Needs review        : {len(review)}")
-    print(f"Collisions          : {collisions}")
+    print(f"Collision groups    : {len(collision_reports)}")
     print(f"Errors              : {errors}")
 
     if not args.write:
