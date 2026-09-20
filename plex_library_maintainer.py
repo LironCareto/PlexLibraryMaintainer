@@ -2,8 +2,9 @@
 """Normalize Plex movie folder names using Plex metadata.
 
 Plex's database is always opened read-only. Dry-run is the default. The only
-filesystem mutation performed with --write is renaming containing movie folders.
-Files inside those folders are never renamed or moved individually.
+filesystem mutation performed with --write is renaming the first movie folder
+immediately below a selected library root. Files and nested folders inside it
+are never renamed or moved individually.
 """
 
 from __future__ import annotations
@@ -187,6 +188,35 @@ def library_root_paths(
     return roots
 
 
+def movie_source_folder(file_path: Path, roots: set[Path]):
+    """Return the library root and first folder below it for a movie file.
+
+    The match is lexical and conservative: the media path must be inside one of
+    the configured Plex roots. If the file is directly in the root, the second
+    return value is None.
+    """
+    matches = []
+    for root in roots:
+        try:
+            relative = file_path.relative_to(root)
+        except ValueError:
+            continue
+        matches.append((root, relative))
+
+    if not matches:
+        return None, None
+
+    # If roots overlap, prefer the most specific matching root.
+    root, relative = max(matches, key=lambda item: len(item[0].parts))
+
+    # A media file directly in the library root has only the filename relative
+    # to that root, so there is no folder for M1 to rename.
+    if len(relative.parts) <= 1:
+        return root, None
+
+    return root, root / relative.parts[0]
+
+
 def movie_rows(
     conn: sqlite3.Connection,
     library_ids: list[int],
@@ -239,13 +269,25 @@ def build_plans(
             continue
 
         file_path = apply_path_maps(row["file"], path_maps)
-        source = file_path.parent
         library_id = int(row["library_section_id"])
+        library_root, source = movie_source_folder(
+            file_path,
+            roots.get(library_id, set()),
+        )
 
-        if source in roots.get(library_id, set()):
+        if library_root is None:
             skipped += 1
             review.append(
-                f"[REVIEW] {file_path}: movie file is directly in the library root"
+                f"[REVIEW] {file_path}: media path is not under any configured "
+                "root for this library"
+            )
+            continue
+
+        if source is None:
+            skipped += 1
+            review.append(
+                f"[NO FOLDER] {file_path}: movie file is directly in the library "
+                "root; skipped in M1"
             )
             continue
 
@@ -332,8 +374,8 @@ def validate_plans(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Normalize movie folder names from Plex metadata. "
-            "Dry-run is the default; files inside folders are never renamed."
+            "Normalize top-level movie folder names from Plex metadata. "
+            "Dry-run is the default; files and nested folders are never renamed."
         )
     )
     parser.add_argument(
