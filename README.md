@@ -8,12 +8,12 @@ Example:
 
 ```text
 Before:
-A.Hologram.for.the.King.2016.BRRip.XviD.AC3-EVO/
-└── A.Hologram.for.the.King.2016.BRRip.XviD.AC3-EVO.avi
+Example Movie/
+└── video.mkv
 
 After:
-A Hologram for the King (2016)/
-└── A.Hologram.for.the.King.2016.BRRip.XviD.AC3-EVO.avi
+Example Movie (2016)/
+└── video.mkv
 ```
 
 **Only the containing folder is renamed. Files inside it keep their original names.**
@@ -124,14 +124,14 @@ directory immediately below the Plex library root.
 For example, if Plex reports:
 
 ```text
-/library/Movies/Foo.Release/CD1/foo.avi
-/library/Movies/Foo.Release/CD2/foo.avi
+/library/Movies/Example Movie/CD1/video-part1.mkv
+/library/Movies/Example Movie/CD2/video-part2.mkv
 ```
 
 both media files map to the single source folder:
 
 ```text
-/library/Movies/Foo.Release/
+/library/Movies/Example Movie/
 ```
 
 Only that folder may be renamed. `CD1`, `CD2`, the video files, subtitles, and
@@ -149,20 +149,22 @@ Only after reviewing the dry-run:
 python3 plex_library_maintainer.py --write
 ```
 
-Every write run creates a mandatory audit log before the first rename:
+All write runs append to one mandatory audit history:
 
 ```text
-logs/rename-YYYYMMDD-HHMMSS.log
+logs/renames.log
 ```
 
-The log is JSON Lines: each successful rename records its timestamp, original
-source path, resulting target path, library, title, and year. Failed rename
-attempts are recorded as `ERROR` entries with the error message. Each entry is
-flushed immediately, so the log remains useful even if a run is interrupted.
+The file is never truncated or replaced by the script. It is JSON Lines, so the
+complete rename history can be searched in one place. Each write run adds a
+`START` record with a `run_id`, and every rename records its own timestamp,
+the same `run_id`, original source path, resulting target path, library, title,
+and year. Failed rename attempts are recorded as `ERROR` entries.
 
-If the audit log cannot be created, the script refuses to perform any rename.
-The `*.log` pattern is ignored by Git, so these machine-specific logs remain
-local.
+Each entry is flushed immediately, so the history remains useful even if a run
+is interrupted. If the audit log cannot be opened for append, the script refuses
+to perform any rename. The `*.log` pattern is ignored by Git, so this local
+history is not committed.
 
 The only filesystem operation performed in M1 is renaming the movie's first directory immediately below the selected library root from its current name to:
 
@@ -177,19 +179,19 @@ Before building that folder name, M1 applies only these explicit conventions:
 ?  -> ¿
 ```
 
-For example, `Mission: Impossible (1996)` becomes
-`Mission; Impossible (1996)`. M1 does not invent substitutions for other
+For example, `Example: Subtitle (2016)` becomes
+`Example; Subtitle (2016)`. M1 does not invent substitutions for other
 problematic characters.
 
 Existing trailing edition markers are part of the folder identity and are kept
 exactly as written:
 
 ```text
-Alien (1979) {edition-Director's Cut}
+Example Movie (2016) {edition-Director's Cut}
 -> Alien (1979) {edition-Director's Cut}
 
-Aliens.Some.Release (1986) {edition-Special Edition}
--> Aliens (1986) {edition-Special Edition}
+Example Movie - old folder (2016) {edition-Special Edition}
+-> Example Movie (2016) {edition-Special Edition}
 ```
 
 M1 does not infer edition names from Plex metadata. It only preserves a
@@ -199,13 +201,13 @@ non-trailing edition marker is reported as `[REVIEW]` and skipped.
 For example:
 
 ```text
-The.Matrix.1999.1080p.BluRay.x265/
+Example Movie - old folder/
 ```
 
 becomes:
 
 ```text
-The Matrix (1999)/
+Example Movie (2016)/
 ```
 
 while files inside remain untouched.
