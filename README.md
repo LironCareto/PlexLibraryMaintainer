@@ -30,6 +30,8 @@ PlexLibraryMaintainer is deliberately conservative:
 - Files and nested folders inside movie folders are never renamed or moved.
 - Library roots are never renamed.
 - Destination folders are never merged or overwritten.
+- A trailing Plex-style `{edition-...}` marker already present in the source
+  folder is preserved literally in the target name.
 - M1 applies only two explicit title substitutions: `:` → `;` and `?` → `¿`.
 - Other unsafe DSM/SMB target names are skipped rather than guessed or rewritten.
 - Proposed renames with an extremely weak textual relationship between the current
@@ -164,6 +166,21 @@ For example, `Mission: Impossible (1996)` becomes
 `Mission; Impossible (1996)`. M1 does not invent substitutions for other
 problematic characters.
 
+Existing trailing edition markers are part of the folder identity and are kept
+exactly as written:
+
+```text
+Alien (1979) {edition-Director's Cut}
+-> Alien (1979) {edition-Director's Cut}
+
+Aliens.Some.Release (1986) {edition-Special Edition}
+-> Aliens (1986) {edition-Special Edition}
+```
+
+M1 does not infer edition names from Plex metadata. It only preserves a
+well-formed trailing `{edition-...}` marker that already exists. A malformed or
+non-trailing edition marker is reported as `[REVIEW]` and skipped.
+
 For example:
 
 ```text
@@ -204,6 +221,8 @@ The tool refuses to guess when a rename is not clearly safe. Examples include:
 - A media path that is not contained by any configured root for its Plex library.
 - A missing or inaccessible source folder.
 - A symlinked movie folder.
+- A malformed or non-trailing `{edition-...}` marker that M1 cannot preserve
+  without interpretation.
 - One source folder associated with more than one Plex title/year.
 - Two source folders that would normalize to the same destination.
 - A destination folder that already exists.
