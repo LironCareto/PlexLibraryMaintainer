@@ -195,6 +195,18 @@ The tool refuses to guess when a rename is not clearly safe. Examples include:
 
 These cases are reported instead of being modified.
 
+For M1 reporting, these categories are kept separate:
+
+- `[NO FOLDER]`: a movie file is directly in the library root. This is a known
+  structural case, not a generic review error.
+- `[REVIEW]`: something is genuinely ambiguous or unsafe and needs inspection.
+- `[COLLISION]`: two or more source folders want the same canonical target, or
+  a target folder already exists. Collisions are reported once per target and
+  list every source folder involved. M1 never chooses a winner or merges them.
+
+The summary therefore reports `No folder`, `Needs review`, and
+`Collision groups` independently.
+
 ## Plex after a rename
 
 Renaming a movie folder changes its filesystem path. Plex may temporarily show the old path as unavailable until it detects or scans the changed files. Run a normal Plex library scan after applying folder renames.
