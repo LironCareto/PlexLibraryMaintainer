@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sqlite3
 import sys
 from collections import defaultdict
@@ -113,16 +112,38 @@ def apply_path_maps(path: str, mappings: list[tuple[str, str]]) -> Path:
     return Path(path)
 
 
-def sanitize_component(value: str) -> str:
-    """Make a title safe as one filesystem path component without over-normalizing."""
-    value = re.sub(r"[\x00-\x1f]", " ", value)
-    value = value.replace("/", "⁄").replace("\\", "⧵")
-    value = re.sub(r"\s+", " ", value).strip()
-    return value
+def canonical_title_component(title: str) -> str:
+    """Apply only the explicit title substitutions approved for M1."""
+    return title.replace(":", ";").replace("?", "¿")
+
+
+def unsafe_component_reason(value: str):
+    """Return a reason if a target folder component is unsafe for M1.
+
+    M1 deliberately refuses to invent replacements beyond the two explicit
+    conventions above. The remaining checks are conservative for DSM/SMB use.
+    """
+    if value in {".", ".."}:
+        return "reserved path component"
+
+    if value.startswith("._"):
+        return "names starting with '._' are reserved by DSM"
+
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        return "contains a control character"
+
+    for char in '<>"/\\|*':
+        if char in value:
+            return f"contains unsupported character {char!r}"
+
+    if value.endswith(" ") or value.endswith("."):
+        return "names ending in a space or dot are not safe for SMB/Windows clients"
+
+    return None
 
 
 def canonical_folder_name(title: str, year: int) -> str:
-    return f"{sanitize_component(title)} ({year})"
+    return f"{canonical_title_component(title)} ({year})"
 
 
 def list_libraries(conn: sqlite3.Connection) -> list[Library]:
@@ -250,7 +271,7 @@ def build_plans(
     conn: sqlite3.Connection,
     libraries: list[Library],
     path_maps: list[tuple[str, str]],
-) -> tuple[list[FolderPlan], list[str], list[str], int]:
+) -> tuple[list[FolderPlan], list[str], list[str], list[str], int]:
     library_by_id = {library.id: library for library in libraries}
     roots = library_root_paths(conn, list(library_by_id), path_maps)
 
@@ -258,6 +279,7 @@ def build_plans(
     skipped = 0
     review: list[str] = []
     no_folder: list[str] = []
+    unsafe_names: list[str] = []
 
     for row in movie_rows(conn, list(library_by_id)):
         title = row["title"]
@@ -308,7 +330,18 @@ def build_plans(
             continue
 
         title, year, library_id = next(iter(metadata_set))
-        target = source.with_name(canonical_folder_name(title, year))
+        target_name = canonical_folder_name(title, year)
+        unsafe_reason = unsafe_component_reason(target_name)
+        if unsafe_reason is not None:
+            skipped += 1
+            unsafe_names.append(
+                f"[UNSAFE NAME] {source}\n"
+                f"  target name: {target_name}\n"
+                f"  reason: {unsafe_reason}"
+            )
+            continue
+
+        target = source.with_name(target_name)
         library = library_by_id[library_id]
         plans.append(
             FolderPlan(
@@ -321,7 +354,7 @@ def build_plans(
             )
         )
 
-    return plans, review, no_folder, skipped
+    return plans, review, no_folder, unsafe_names, skipped
 
 
 def validate_plans(
@@ -511,7 +544,7 @@ def main() -> int:
                 print(f"[FATAL] {error}", file=sys.stderr)
             return 2
 
-        plans, build_review, no_folder, build_skipped = build_plans(
+        plans, build_review, no_folder, unsafe_names, build_skipped = build_plans(
             conn,
             libraries,
             path_maps,
@@ -541,6 +574,9 @@ def main() -> int:
         print()
 
     for line in no_folder:
+        print(line)
+
+    for line in unsafe_names:
         print(line)
 
     for line in review:
@@ -578,6 +614,7 @@ def main() -> int:
     print(f"Would rename        : {len(actionable) if not args.write else 0}")
     print(f"Renamed             : {renamed}")
     print(f"No folder           : {len(no_folder)}")
+    print(f"Unsafe names        : {len(unsafe_names)}")
     print(f"Needs review        : {len(review)}")
     print(f"Collision groups    : {len(collision_reports)}")
     print(f"Errors              : {errors}")
