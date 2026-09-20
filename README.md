@@ -149,6 +149,21 @@ Only after reviewing the dry-run:
 python3 plex_library_maintainer.py --write
 ```
 
+Every write run creates a mandatory audit log before the first rename:
+
+```text
+logs/rename-YYYYMMDD-HHMMSS.log
+```
+
+The log is JSON Lines: each successful rename records its timestamp, original
+source path, resulting target path, library, title, and year. Failed rename
+attempts are recorded as `ERROR` entries with the error message. Each entry is
+flushed immediately, so the log remains useful even if a run is interrupted.
+
+If the audit log cannot be created, the script refuses to perform any rename.
+The `*.log` pattern is ignored by Git, so these machine-specific logs remain
+local.
+
 The only filesystem operation performed in M1 is renaming the movie's first directory immediately below the selected library root from its current name to:
 
 ```text
