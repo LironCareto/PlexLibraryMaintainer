@@ -26,7 +26,8 @@ PlexLibraryMaintainer is deliberately conservative:
 - `PRAGMA query_only = ON` adds a second read-only safeguard.
 - Dry-run is the default.
 - No folder is renamed unless `--write` is explicitly supplied.
-- Files inside movie folders are never renamed or moved.
+- Only the **first directory immediately below a selected library root** is ever considered for renaming.
+- Files and nested folders inside movie folders are never renamed or moved.
 - Library roots are never renamed.
 - Destination folders are never merged or overwritten.
 - Ambiguous folders are skipped and reported for review.
@@ -109,6 +110,31 @@ python3 plex_library_maintainer.py \
 
 A dry-run prints every proposed rename but changes nothing.
 
+### M1 folder-selection rule
+
+M1 deliberately operates only on an existing top-level movie folder: the first
+directory immediately below the Plex library root.
+
+For example, if Plex reports:
+
+```text
+/library/Movies/Foo.Release/CD1/foo.avi
+/library/Movies/Foo.Release/CD2/foo.avi
+```
+
+both media files map to the single source folder:
+
+```text
+/library/Movies/Foo.Release/
+```
+
+Only that folder may be renamed. `CD1`, `CD2`, the video files, subtitles, and
+anything else below it are left untouched.
+
+If a movie file is directly in the library root, M1 reports it as
+`[NO FOLDER]` and skips it. Creating or selecting a destination folder for such
+files is intentionally deferred to a later milestone.
+
 ### Apply the renames
 
 Only after reviewing the dry-run:
@@ -117,7 +143,7 @@ Only after reviewing the dry-run:
 python3 plex_library_maintainer.py --write
 ```
 
-The only filesystem operation performed is renaming the movie's containing directory from its current name to:
+The only filesystem operation performed in M1 is renaming the movie's first directory immediately below the selected library root from its current name to:
 
 ```text
 <Plex title> (<Plex year>)
@@ -159,7 +185,8 @@ The tool refuses to guess when a rename is not clearly safe. Examples include:
 
 - Plex metadata without a title or year.
 - A selected library that is not a movie library.
-- A movie file stored directly in the library root.
+- A movie file stored directly in the library root (reported as `[NO FOLDER]` in M1).
+- A media path that is not contained by any configured root for its Plex library.
 - A missing or inaccessible source folder.
 - A symlinked movie folder.
 - One source folder associated with more than one Plex title/year.
