@@ -14,12 +14,15 @@ import json
 import os
 import sqlite3
 import sys
+import unicodedata
+from difflib import SequenceMatcher
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
 LIBRARY_DB = "com.plexapp.plugins.library.db"
 DEFAULT_CONFIG = Path("config.json")
+SUSPICIOUS_SIMILARITY_THRESHOLD = 0.55
 
 
 @dataclass(frozen=True)
@@ -144,6 +147,78 @@ def unsafe_component_reason(value: str):
 
 def canonical_folder_name(title: str, year: int) -> str:
     return f"{canonical_title_component(title)} ({year})"
+
+
+def comparison_text(value: str) -> str:
+    """Normalize text only for the M1 mismatch safety check."""
+    value = unicodedata.normalize("NFKD", value).casefold()
+    value = "".join(
+        char
+        for char in value
+        if unicodedata.category(char) != "Mn"
+    )
+    value = "".join(char if char.isalnum() else " " for char in value)
+    return " ".join(value.split())
+
+
+def suspicious_title_match(plan: FolderPlan):
+    """Return a similarity score when a proposed rename looks suspicious.
+
+    This is a guardrail, not a title parser. A rename is considered plausible
+    when the normalized Plex title appears as a whole phrase in the source
+    folder name, when the source phrase appears in the title, when they share a
+    meaningful token, or when their character similarity is reasonably high.
+    """
+    source_tokens = [
+        token
+        for token in comparison_text(plan.source.name).split()
+        if token != str(plan.year)
+    ]
+    title_tokens = comparison_text(plan.title).split()
+
+    source_text = " ".join(source_tokens)
+    title_text = " ".join(title_tokens)
+
+    if not source_text or not title_text:
+        return 0.0
+
+    padded_source = f" {source_text} "
+    padded_title = f" {title_text} "
+    if padded_title in padded_source or padded_source in padded_title:
+        return None
+
+    source_meaningful = {token for token in source_tokens if len(token) >= 4}
+    title_meaningful = {token for token in title_tokens if len(token) >= 4}
+    if source_meaningful & title_meaningful:
+        return None
+
+    score = SequenceMatcher(None, source_text, title_text).ratio()
+    if score >= SUSPICIOUS_SIMILARITY_THRESHOLD:
+        return None
+
+    return score
+
+
+def split_suspicious_plans(
+    plans: list[FolderPlan],
+) -> tuple[list[FolderPlan], list[str]]:
+    safe: list[FolderPlan] = []
+    suspicious: list[str] = []
+
+    for plan in plans:
+        score = suspicious_title_match(plan)
+        if score is None:
+            safe.append(plan)
+            continue
+
+        suspicious.append(
+            f"[SUSPICIOUS] {plan.source}\n"
+            f"  Plex title: {plan.title} ({plan.year})\n"
+            f"  proposed target: {plan.target}\n"
+            f"  similarity: {score:.2f}; skipped in M1"
+        )
+
+    return safe, suspicious
 
 
 def list_libraries(conn: sqlite3.Connection) -> list[Library]:
@@ -556,6 +631,7 @@ def main() -> int:
         conn.close()
 
     actionable, validation_review, collision_reports, already_normalized = validate_plans(plans)
+    actionable, suspicious = split_suspicious_plans(actionable)
     review = build_review + validation_review
 
     print("PlexLibraryMaintainer")
@@ -577,6 +653,9 @@ def main() -> int:
         print(line)
 
     for line in unsafe_names:
+        print(line)
+
+    for line in suspicious:
         print(line)
 
     for line in review:
@@ -615,6 +694,7 @@ def main() -> int:
     print(f"Renamed             : {renamed}")
     print(f"No folder           : {len(no_folder)}")
     print(f"Unsafe names        : {len(unsafe_names)}")
+    print(f"Suspicious matches  : {len(suspicious)}")
     print(f"Needs review        : {len(review)}")
     print(f"Collision groups    : {len(collision_reports)}")
     print(f"Errors              : {errors}")
