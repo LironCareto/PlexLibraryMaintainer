@@ -32,6 +32,8 @@ PlexLibraryMaintainer is deliberately conservative:
 - Destination folders are never merged or overwritten.
 - M1 applies only two explicit title substitutions: `:` → `;` and `?` → `¿`.
 - Other unsafe DSM/SMB target names are skipped rather than guessed or rewritten.
+- Proposed renames with an extremely weak textual relationship between the current
+  folder name and Plex title are reported as `[SUSPICIOUS]` and skipped.
 - Ambiguous folders are skipped and reported for review.
 - Only Plex libraries of type **movie** are eligible for folder normalization.
 - Machine-specific paths and library choices can live in local `config.json`, which is ignored by Git.
@@ -209,6 +211,10 @@ The tool refuses to guess when a rename is not clearly safe. Examples include:
   `?` → `¿` substitutions. M1 conservatively rejects remaining path
   separators/reserved characters, control characters, DSM-reserved `._`
   prefixes, and unsafe trailing space/dot cases.
+- A proposed rename whose current folder name and Plex title have no whole-title
+  containment, no shared meaningful token, and low normalized character
+  similarity. This check is only a safety veto: it never guesses or changes a
+  title.
 
 These cases are reported instead of being modified.
 
@@ -218,13 +224,16 @@ For M1 reporting, these categories are kept separate:
   structural case, not a generic review error.
 - `[UNSAFE NAME]`: Plex's title would produce a target that M1 refuses to
   create after the two explicit title substitutions.
+- `[SUSPICIOUS]`: Plex metadata may be correct, translated, transliterated, or
+  simply wrong, but the current folder and Plex title are too dissimilar for M1
+  to rename automatically.
 - `[REVIEW]`: something is genuinely ambiguous and needs inspection.
 - `[COLLISION]`: two or more source folders want the same canonical target, or
   a target folder already exists. Collisions are reported once per target and
   list every source folder involved. M1 never chooses a winner or merges them.
 
-The summary therefore reports `No folder`, `Unsafe names`, `Needs review`,
-and `Collision groups` independently.
+The summary therefore reports `No folder`, `Unsafe names`,
+`Suspicious matches`, `Needs review`, and `Collision groups` independently.
 
 ## Plex after a rename
 
@@ -236,7 +245,8 @@ Renaming a movie folder changes its filesystem path. Plex may temporarily show t
 - It does not rename subtitle files.
 - It does not move files between folders.
 - It does not merge folders.
-- It does not use fuzzy title parsing.
+- It does not use fuzzy title parsing to choose or rewrite titles. A conservative
+  text-similarity check is used only to veto suspicious renames.
 - It does not call TMDB, IMDb, or any external metadata service.
 - It does not modify Plex metadata or Plex databases.
 - It does not normalize TV show or music libraries.
