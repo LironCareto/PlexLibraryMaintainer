@@ -230,29 +230,31 @@ def suspicious_title_match(plan: FolderPlan):
 
 
 def create_rename_log():
-    """Create a per-run JSON-lines audit log before any filesystem mutation."""
+    """Open the single append-only JSON-lines rename audit history."""
     log_dir = Path("logs")
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
-    log_path = log_dir / f"rename-{timestamp}.log"
-    handle = log_path.open("x", encoding="utf-8")
+    log_path = log_dir / "renames.log"
+    handle = log_path.open("a", encoding="utf-8")
+    run_id = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
 
     header = {
         "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
         "status": "START",
+        "run_id": run_id,
         "tool": "PlexLibraryMaintainer",
         "mode": "write",
     }
     handle.write(json.dumps(header, ensure_ascii=False) + "\n")
     handle.flush()
-    return log_path, handle
+    return log_path, handle, run_id
 
 
-def write_rename_log(handle, status: str, plan: FolderPlan, error=None):
+def write_rename_log(handle, run_id: str, status: str, plan: FolderPlan, error=None):
     record = {
         "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
         "status": status,
+        "run_id": run_id,
         "source": str(plan.source),
         "target": str(plan.target),
         "library": plan.library_name,
@@ -745,10 +747,11 @@ def main() -> int:
     errors = 0
     rename_log_path = None
     rename_log_handle = None
+    rename_run_id = None
 
     if args.write:
         try:
-            rename_log_path, rename_log_handle = create_rename_log()
+            rename_log_path, rename_log_handle, rename_run_id = create_rename_log()
         except OSError as exc:
             print(
                 f"[FATAL] Could not create rename audit log; refusing to write: {exc}",
@@ -768,11 +771,11 @@ def main() -> int:
                 try:
                     os.rename(plan.source, plan.target)
                     renamed += 1
-                    write_rename_log(rename_log_handle, "RENAMED", plan)
+                    write_rename_log(rename_log_handle, rename_run_id, "RENAMED", plan)
                     print(f"[RENAMED] {plan.source} -> {plan.target}")
                 except OSError as exc:
                     errors += 1
-                    write_rename_log(rename_log_handle, "ERROR", plan, error=exc)
+                    write_rename_log(rename_log_handle, rename_run_id, "ERROR", plan, error=exc)
                     print(
                         f"[ERROR] Could not rename {plan.source} -> {plan.target}: {exc}",
                         file=sys.stderr,
