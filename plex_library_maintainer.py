@@ -145,8 +145,37 @@ def unsafe_component_reason(value: str):
     return None
 
 
-def canonical_folder_name(title: str, year: int) -> str:
-    return f"{canonical_title_component(title)} ({year})"
+def trailing_edition_marker(source_name: str):
+    """Return a trailing {edition-...} marker exactly as written.
+
+    M1 does not interpret edition text. It only preserves a well-formed marker
+    already present at the end of the source folder name.
+    """
+    lowered = source_name.casefold()
+    start = lowered.rfind("{edition-")
+    if start == -1:
+        return None
+
+    end = source_name.find("}", start)
+    if end == -1:
+        return None
+
+    if source_name[end + 1:].strip():
+        return None
+
+    marker = source_name[start:end + 1]
+    payload = marker[len("{edition-"):-1].strip()
+    if not payload:
+        return None
+
+    return marker
+
+
+def canonical_folder_name(title: str, year: int, edition_marker=None) -> str:
+    name = f"{canonical_title_component(title)} ({year})"
+    if edition_marker:
+        name += f" {edition_marker}"
+    return name
 
 
 def comparison_text(value: str) -> str:
@@ -405,7 +434,17 @@ def build_plans(
             continue
 
         title, year, library_id = next(iter(metadata_set))
-        target_name = canonical_folder_name(title, year)
+
+        edition_marker = trailing_edition_marker(source.name)
+        if "{edition-" in source.name.casefold() and edition_marker is None:
+            skipped += 1
+            review.append(
+                f"[REVIEW] {source}: malformed or non-trailing edition marker; "
+                "M1 will not discard or reinterpret it"
+            )
+            continue
+
+        target_name = canonical_folder_name(title, year, edition_marker)
         unsafe_reason = unsafe_component_reason(target_name)
         if unsafe_reason is not None:
             skipped += 1
