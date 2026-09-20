@@ -30,6 +30,8 @@ PlexLibraryMaintainer is deliberately conservative:
 - Files and nested folders inside movie folders are never renamed or moved.
 - Library roots are never renamed.
 - Destination folders are never merged or overwritten.
+- M1 applies only two explicit title substitutions: `:` → `;` and `?` → `¿`.
+- Other unsafe DSM/SMB target names are skipped rather than guessed or rewritten.
 - Ambiguous folders are skipped and reported for review.
 - Only Plex libraries of type **movie** are eligible for folder normalization.
 - Machine-specific paths and library choices can live in local `config.json`, which is ignored by Git.
@@ -149,6 +151,17 @@ The only filesystem operation performed in M1 is renaming the movie's first dire
 <Plex title> (<Plex year>)
 ```
 
+Before building that folder name, M1 applies only these explicit conventions:
+
+```text
+:  -> ;
+?  -> ¿
+```
+
+For example, `Mission: Impossible (1996)` becomes
+`Mission; Impossible (1996)`. M1 does not invent substitutions for other
+problematic characters.
+
 For example:
 
 ```text
@@ -192,6 +205,10 @@ The tool refuses to guess when a rename is not clearly safe. Examples include:
 - One source folder associated with more than one Plex title/year.
 - Two source folders that would normalize to the same destination.
 - A destination folder that already exists.
+- A target name that remains unsafe after the explicit `:` → `;` and
+  `?` → `¿` substitutions. M1 conservatively rejects remaining path
+  separators/reserved characters, control characters, DSM-reserved `._`
+  prefixes, and unsafe trailing space/dot cases.
 
 These cases are reported instead of being modified.
 
@@ -199,13 +216,15 @@ For M1 reporting, these categories are kept separate:
 
 - `[NO FOLDER]`: a movie file is directly in the library root. This is a known
   structural case, not a generic review error.
-- `[REVIEW]`: something is genuinely ambiguous or unsafe and needs inspection.
+- `[UNSAFE NAME]`: Plex's title would produce a target that M1 refuses to
+  create after the two explicit title substitutions.
+- `[REVIEW]`: something is genuinely ambiguous and needs inspection.
 - `[COLLISION]`: two or more source folders want the same canonical target, or
   a target folder already exists. Collisions are reported once per target and
   list every source folder involved. M1 never chooses a winner or merges them.
 
-The summary therefore reports `No folder`, `Needs review`, and
-`Collision groups` independently.
+The summary therefore reports `No folder`, `Unsafe names`, `Needs review`,
+and `Collision groups` independently.
 
 ## Plex after a rename
 
