@@ -42,7 +42,7 @@ class FolderPlan:
     source: Path
     target: Path
     title: str
-    year: int
+    year: int | None
     library_id: int
     library_name: str
 
@@ -56,7 +56,7 @@ class RootFilePlan:
     source: Path
     target: Path
     title: str
-    year: int
+    year: int | None
     library_id: int
     library_name: str
 
@@ -145,6 +145,9 @@ def unsafe_component_reason(value: str):
     M1 deliberately refuses to invent replacements beyond the two explicit
     conventions above. The remaining checks are conservative for DSM/SMB use.
     """
+    if not value:
+        return "empty path component"
+
     if value in {".", ".."}:
         return "reserved path component"
 
@@ -190,8 +193,20 @@ def trailing_edition_marker(source_name: str):
     return marker
 
 
-def canonical_folder_name(title: str, year: int, edition_marker=None) -> str:
-    name = f"{canonical_title_component(title)} ({year})"
+def display_title_year(title: str, year: int | None) -> str:
+    return f"{title} ({year})" if year is not None else title
+
+
+def canonical_folder_name(title: str, year: int | None, edition_marker=None) -> str:
+    title_component = canonical_title_component(title)
+    if year is None:
+        # Without a year suffix, a trailing dot/space would become the final
+        # character of the folder name and is unsafe on DSM/SMB.
+        title_component = title_component.rstrip(" .")
+        name = title_component
+    else:
+        name = f"{title_component} ({year})"
+
     if edition_marker:
         name += f" {edition_marker}"
     return name
@@ -231,10 +246,11 @@ def suspicious_title_match(plan: FolderPlan):
     folder name, when the source phrase appears in the title, when they share a
     meaningful token, or when their character similarity is reasonably high.
     """
+    year_token = str(plan.year) if plan.year is not None else None
     source_tokens = [
         token
         for token in comparison_text(plan.comparison_name).split()
-        if token != str(plan.year)
+        if year_token is None or token != year_token
     ]
     title_tokens = comparison_text(plan.title).split()
 
@@ -315,7 +331,7 @@ def split_suspicious_plans(
 
         suspicious.append(
             f"[SUSPICIOUS] {plan.source}\n"
-            f"  Plex title: {plan.title} ({plan.year})\n"
+            f"  Plex title: {display_title_year(plan.title, plan.year)}\n"
             f"  proposed target: {plan.target}\n"
             f"  similarity: {score:.2f}; skipped in {milestone}"
         )
@@ -452,8 +468,8 @@ def build_plans(
     library_by_id = {library.id: library for library in libraries}
     roots = library_root_paths(conn, list(library_by_id), path_maps)
 
-    folder_metadata: dict[Path, set[tuple[str, int, int]]] = defaultdict(set)
-    root_file_metadata: dict[Path, set[tuple[str, int, int]]] = defaultdict(set)
+    folder_metadata: dict[Path, set[tuple[str, int | None, int]]] = defaultdict(set)
+    root_file_metadata: dict[Path, set[tuple[str, int | None, int]]] = defaultdict(set)
     skipped = 0
     review: list[str] = []
     unsafe_names: list[str] = []
@@ -461,10 +477,10 @@ def build_plans(
     for row in movie_rows(conn, list(library_by_id)):
         title = row["title"]
         year = row["year"]
-        if not title or not year:
+        if not title:
             skipped += 1
             review.append(
-                f"[REVIEW] metadata id {row['metadata_id']}: missing title or year"
+                f"[REVIEW] metadata id {row['metadata_id']}: missing title"
             )
             continue
 
@@ -483,7 +499,8 @@ def build_plans(
             )
             continue
 
-        metadata = (str(title), int(year), library_id)
+        year_value = int(year) if year is not None else None
+        metadata = (str(title), year_value, library_id)
         if source is None:
             root_file_metadata[file_path].add(metadata)
             continue
@@ -496,7 +513,16 @@ def build_plans(
         if len(metadata_set) != 1:
             skipped += 1
             values = ", ".join(
-                f"{title} ({year})" for title, year, _ in sorted(metadata_set)
+                display_title_year(title, year)
+                for title, year, _ in sorted(
+                    metadata_set,
+                    key=lambda item: (
+                        item[0].casefold(),
+                        item[1] is None,
+                        item[1] if item[1] is not None else -1,
+                        item[2],
+                    ),
+                )
             )
             review.append(
                 f"[REVIEW] {source}: multiple Plex identities share this folder: {values}"
@@ -545,7 +571,16 @@ def build_plans(
         if len(metadata_set) != 1:
             skipped += 1
             values = ", ".join(
-                f"{title} ({year})" for title, year, _ in sorted(metadata_set)
+                display_title_year(title, year)
+                for title, year, _ in sorted(
+                    metadata_set,
+                    key=lambda item: (
+                        item[0].casefold(),
+                        item[1] is None,
+                        item[1] if item[1] is not None else -1,
+                        item[2],
+                    ),
+                )
             )
             review.append(
                 f"[REVIEW] {source}: multiple Plex identities share this root file: {values}"
@@ -898,67 +933,3 @@ def main() -> int:
                     )
 
             runtime_reserved: set[Path] = set()
-            for plan in root_actionable:
-                try:
-                    target_dir = plan.target.parent
-                    if target_dir.exists():
-                        if not target_dir.is_dir() or target_dir.is_symlink():
-                            raise OSError(f"unsafe target folder: {target_dir}")
-                    else:
-                        target_dir.mkdir()
-
-                    preferred_target = target_dir / plan.source.name
-                    actual_target = available_file_target(preferred_target, runtime_reserved)
-                    runtime_reserved.add(actual_target)
-
-                    os.rename(plan.source, actual_target)
-                    moved += 1
-                    write_rename_log(
-                        rename_log_handle,
-                        rename_run_id,
-                        "MOVED",
-                        plan,
-                        target=actual_target,
-                    )
-                    print(f"[MOVED] {plan.source} -> {actual_target}")
-                except OSError as exc:
-                    errors += 1
-                    write_rename_log(
-                        rename_log_handle,
-                        rename_run_id,
-                        "ERROR",
-                        plan,
-                        error=exc,
-                    )
-                    print(
-                        f"[ERROR] Could not move {plan.source}: {exc}",
-                        file=sys.stderr,
-                    )
-        finally:
-            rename_log_handle.close()
-
-    print()
-    print("Summary")
-    print("=======")
-    print(f"Items examined      : {len(plans) + len(root_file_plans) + build_skipped}")
-    print(f"Already normalized  : {already_normalized}")
-    print(f"Would rename        : {len(actionable) if not args.write else 0}")
-    print(f"Would move          : {len(root_actionable) if not args.write else 0}")
-    print(f"Renamed             : {renamed}")
-    print(f"Moved               : {moved}")
-    print(f"Unsafe names        : {len(unsafe_names)}")
-    print(f"Suspicious matches  : {len(suspicious)}")
-    print(f"Needs review        : {len(review)}")
-    print(f"Collision groups    : {len(collision_reports)}")
-    print(f"Errors              : {errors}")
-    if rename_log_path is not None:
-        print(f"Rename audit log    : {rename_log_path}")
-
-    if not args.write:
-        print("\nDRY RUN ONLY. Nothing was changed. Add --write to apply folder renames and root-file moves.")
-
-    return 1 if errors else 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
