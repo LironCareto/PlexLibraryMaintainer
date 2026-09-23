@@ -200,8 +200,8 @@ def display_title_year(title: str, year: int | None) -> str:
 def canonical_folder_name(title: str, year: int | None, edition_marker=None) -> str:
     title_component = canonical_title_component(title)
     if year is None:
-        # Without a year suffix, a trailing dot/space would become the final
-        # character of the folder name and is unsafe on DSM/SMB.
+        # With no year suffix, a trailing dot or space from Plex would become
+        # the final character of the folder name and is unsafe on DSM/SMB.
         title_component = title_component.rstrip(" .")
         name = title_component
     else:
@@ -933,3 +933,67 @@ def main() -> int:
                     )
 
             runtime_reserved: set[Path] = set()
+            for plan in root_actionable:
+                try:
+                    target_dir = plan.target.parent
+                    if target_dir.exists():
+                        if not target_dir.is_dir() or target_dir.is_symlink():
+                            raise OSError(f"unsafe target folder: {target_dir}")
+                    else:
+                        target_dir.mkdir()
+
+                    preferred_target = target_dir / plan.source.name
+                    actual_target = available_file_target(preferred_target, runtime_reserved)
+                    runtime_reserved.add(actual_target)
+
+                    os.rename(plan.source, actual_target)
+                    moved += 1
+                    write_rename_log(
+                        rename_log_handle,
+                        rename_run_id,
+                        "MOVED",
+                        plan,
+                        target=actual_target,
+                    )
+                    print(f"[MOVED] {plan.source} -> {actual_target}")
+                except OSError as exc:
+                    errors += 1
+                    write_rename_log(
+                        rename_log_handle,
+                        rename_run_id,
+                        "ERROR",
+                        plan,
+                        error=exc,
+                    )
+                    print(
+                        f"[ERROR] Could not move {plan.source}: {exc}",
+                        file=sys.stderr,
+                    )
+        finally:
+            rename_log_handle.close()
+
+    print()
+    print("Summary")
+    print("=======")
+    print(f"Items examined      : {len(plans) + len(root_file_plans) + build_skipped}")
+    print(f"Already normalized  : {already_normalized}")
+    print(f"Would rename        : {len(actionable) if not args.write else 0}")
+    print(f"Would move          : {len(root_actionable) if not args.write else 0}")
+    print(f"Renamed             : {renamed}")
+    print(f"Moved               : {moved}")
+    print(f"Unsafe names        : {len(unsafe_names)}")
+    print(f"Suspicious matches  : {len(suspicious)}")
+    print(f"Needs review        : {len(review)}")
+    print(f"Collision groups    : {len(collision_reports)}")
+    print(f"Errors              : {errors}")
+    if rename_log_path is not None:
+        print(f"Rename audit log    : {rename_log_path}")
+
+    if not args.write:
+        print("\nDRY RUN ONLY. Nothing was changed. Add --write to apply folder renames and root-file moves.")
+
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
