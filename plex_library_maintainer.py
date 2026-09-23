@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Normalize Plex movie folder names using Plex metadata.
 
-Plex's database is always opened read-only. Dry-run is the default. The only
-filesystem mutation performed with --write is renaming the first movie folder
-immediately below a selected library root. Files and nested folders inside it
-are never renamed or moved individually.
+Plex's database is always opened read-only. Dry-run is the default. With
+--write, the tool can rename the first movie folder immediately below a
+selected library root and can place Plex-indexed movie files that live directly
+in the library root into their canonical movie folder.
 """
 
 from __future__ import annotations
@@ -45,6 +45,24 @@ class FolderPlan:
     year: int
     library_id: int
     library_name: str
+
+    @property
+    def comparison_name(self) -> str:
+        return self.source.name
+
+
+@dataclass(frozen=True)
+class RootFilePlan:
+    source: Path
+    target: Path
+    title: str
+    year: int
+    library_id: int
+    library_name: str
+
+    @property
+    def comparison_name(self) -> str:
+        return self.source.stem
 
 
 def open_readonly(db_path: Path) -> sqlite3.Connection:
@@ -179,6 +197,20 @@ def canonical_folder_name(title: str, year: int, edition_marker=None) -> str:
     return name
 
 
+def available_file_target(target: Path, reserved: set[Path] | None = None) -> Path:
+    """Return target, or target with (n) before its extension, without clobbering."""
+    reserved = reserved or set()
+    if not target.exists() and target not in reserved:
+        return target
+
+    index = 1
+    while True:
+        candidate = target.with_name(f"{target.stem} ({index}){target.suffix}")
+        if not candidate.exists() and candidate not in reserved:
+            return candidate
+        index += 1
+
+
 def comparison_text(value: str) -> str:
     """Normalize text only for the M1 mismatch safety check."""
     value = unicodedata.normalize("NFKD", value).casefold()
@@ -201,7 +233,7 @@ def suspicious_title_match(plan: FolderPlan):
     """
     source_tokens = [
         token
-        for token in comparison_text(plan.source.name).split()
+        for token in comparison_text(plan.comparison_name).split()
         if token != str(plan.year)
     ]
     title_tokens = comparison_text(plan.title).split()
@@ -250,13 +282,13 @@ def create_rename_log():
     return log_path, handle, run_id
 
 
-def write_rename_log(handle, run_id: str, status: str, plan: FolderPlan, error=None):
+def write_rename_log(handle, run_id: str, status: str, plan, error=None, target=None):
     record = {
         "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
         "status": status,
         "run_id": run_id,
         "source": str(plan.source),
-        "target": str(plan.target),
+        "target": str(target if target is not None else plan.target),
         "library": plan.library_name,
         "title": plan.title,
         "year": plan.year,
@@ -269,9 +301,10 @@ def write_rename_log(handle, run_id: str, status: str, plan: FolderPlan, error=N
 
 
 def split_suspicious_plans(
-    plans: list[FolderPlan],
-) -> tuple[list[FolderPlan], list[str]]:
-    safe: list[FolderPlan] = []
+    plans,
+    milestone: str,
+):
+    safe = []
     suspicious: list[str] = []
 
     for plan in plans:
@@ -284,7 +317,7 @@ def split_suspicious_plans(
             f"[SUSPICIOUS] {plan.source}\n"
             f"  Plex title: {plan.title} ({plan.year})\n"
             f"  proposed target: {plan.target}\n"
-            f"  similarity: {score:.2f}; skipped in M1"
+            f"  similarity: {score:.2f}; skipped in {milestone}"
         )
 
     return safe, suspicious
@@ -415,14 +448,14 @@ def build_plans(
     conn: sqlite3.Connection,
     libraries: list[Library],
     path_maps: list[tuple[str, str]],
-) -> tuple[list[FolderPlan], list[str], list[str], list[str], int]:
+) -> tuple[list[FolderPlan], list[RootFilePlan], list[str], list[str], int]:
     library_by_id = {library.id: library for library in libraries}
     roots = library_root_paths(conn, list(library_by_id), path_maps)
 
     folder_metadata: dict[Path, set[tuple[str, int, int]]] = defaultdict(set)
+    root_file_metadata: dict[Path, set[tuple[str, int, int]]] = defaultdict(set)
     skipped = 0
     review: list[str] = []
-    no_folder: list[str] = []
     unsafe_names: list[str] = []
 
     for row in movie_rows(conn, list(library_by_id)):
@@ -450,17 +483,14 @@ def build_plans(
             )
             continue
 
+        metadata = (str(title), int(year), library_id)
         if source is None:
-            skipped += 1
-            no_folder.append(
-                f"[NO FOLDER] {file_path}: movie file is directly in the library "
-                "root; skipped in M1"
-            )
+            root_file_metadata[file_path].add(metadata)
             continue
 
-        folder_metadata[source].add((str(title), int(year), library_id))
+        folder_metadata[source].add(metadata)
 
-    plans: list[FolderPlan] = []
+    folder_plans: list[FolderPlan] = []
 
     for source, metadata_set in folder_metadata.items():
         if len(metadata_set) != 1:
@@ -497,7 +527,7 @@ def build_plans(
 
         target = source.with_name(target_name)
         library = library_by_id[library_id]
-        plans.append(
+        folder_plans.append(
             FolderPlan(
                 source=source,
                 target=target,
@@ -508,8 +538,87 @@ def build_plans(
             )
         )
 
-    return plans, review, no_folder, unsafe_names, skipped
+    root_file_plans: list[RootFilePlan] = []
+    reserved_targets: set[Path] = set()
 
+    for source, metadata_set in root_file_metadata.items():
+        if len(metadata_set) != 1:
+            skipped += 1
+            values = ", ".join(
+                f"{title} ({year})" for title, year, _ in sorted(metadata_set)
+            )
+            review.append(
+                f"[REVIEW] {source}: multiple Plex identities share this root file: {values}"
+            )
+            continue
+
+        title, year, library_id = next(iter(metadata_set))
+
+        if not source.exists():
+            skipped += 1
+            review.append(f"[REVIEW] root movie file does not exist: {source}")
+            continue
+        if not source.is_file():
+            skipped += 1
+            review.append(f"[REVIEW] root movie path is not a file: {source}")
+            continue
+        if source.is_symlink():
+            skipped += 1
+            review.append(f"[REVIEW] refusing to move symlinked root movie file: {source}")
+            continue
+
+        edition_marker = trailing_edition_marker(source.stem)
+        if "{edition-" in source.stem.casefold() and edition_marker is None:
+            skipped += 1
+            review.append(
+                f"[REVIEW] {source}: malformed or non-trailing edition marker; "
+                "M2 will not discard or reinterpret it"
+            )
+            continue
+
+        target_folder_name = canonical_folder_name(title, year, edition_marker)
+        unsafe_reason = unsafe_component_reason(target_folder_name)
+        if unsafe_reason is not None:
+            skipped += 1
+            unsafe_names.append(
+                f"[UNSAFE NAME] {source}\n"
+                f"  target folder: {target_folder_name}\n"
+                f"  reason: {unsafe_reason}"
+            )
+            continue
+
+        target_dir = source.parent / target_folder_name
+        if target_dir.exists():
+            if not target_dir.is_dir():
+                skipped += 1
+                review.append(
+                    f"[REVIEW] target movie folder path is not a directory: {target_dir}"
+                )
+                continue
+            if target_dir.is_symlink():
+                skipped += 1
+                review.append(
+                    f"[REVIEW] refusing to move into symlinked target folder: {target_dir}"
+                )
+                continue
+
+        preferred_target = target_dir / source.name
+        target = available_file_target(preferred_target, reserved_targets)
+        reserved_targets.add(target)
+
+        library = library_by_id[library_id]
+        root_file_plans.append(
+            RootFilePlan(
+                source=source,
+                target=target,
+                title=title,
+                year=year,
+                library_id=library_id,
+                library_name=library.name,
+            )
+        )
+
+    return folder_plans, root_file_plans, review, unsafe_names, skipped
 
 def validate_plans(
     plans: list[FolderPlan],
@@ -578,8 +687,8 @@ def validate_plans(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Normalize top-level movie folder names from Plex metadata. "
-            "Dry-run is the default; files and nested folders are never renamed."
+            "Normalize movie folders and organize root-level movie files from Plex metadata. "
+            "Dry-run is the default."
         )
     )
     parser.add_argument(
@@ -625,7 +734,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--write",
         action="store_true",
-        help="Actually rename folders. Without this flag nothing is changed.",
+        help="Actually apply folder renames and root-file moves. Without this flag nothing is changed.",
     )
     return parser
 
@@ -698,7 +807,7 @@ def main() -> int:
                 print(f"[FATAL] {error}", file=sys.stderr)
             return 2
 
-        plans, build_review, no_folder, unsafe_names, build_skipped = build_plans(
+        plans, root_file_plans, build_review, unsafe_names, build_skipped = build_plans(
             conn,
             libraries,
             path_maps,
@@ -710,7 +819,9 @@ def main() -> int:
         conn.close()
 
     actionable, validation_review, collision_reports, already_normalized = validate_plans(plans)
-    actionable, suspicious = split_suspicious_plans(actionable)
+    actionable, suspicious = split_suspicious_plans(actionable, "M1")
+    root_actionable, root_suspicious = split_suspicious_plans(root_file_plans, "M2")
+    suspicious = suspicious + root_suspicious
     review = build_review + validation_review
 
     print("PlexLibraryMaintainer")
@@ -728,8 +839,12 @@ def main() -> int:
             print("         [DRY RUN: not renamed]")
         print()
 
-    for line in no_folder:
-        print(line)
+    for plan in root_actionable:
+        print(f"[MOVE] [{plan.library_name}] {plan.source}")
+        print(f"    -> {plan.target}")
+        if not args.write:
+            print("       [DRY RUN: not moved]")
+        print()
 
     for line in unsafe_names:
         print(line)
@@ -744,6 +859,7 @@ def main() -> int:
         print(report)
 
     renamed = 0
+    moved = 0
     errors = 0
     rename_log_path = None
     rename_log_handle = None
@@ -780,17 +896,56 @@ def main() -> int:
                         f"[ERROR] Could not rename {plan.source} -> {plan.target}: {exc}",
                         file=sys.stderr,
                     )
+
+            runtime_reserved: set[Path] = set()
+            for plan in root_actionable:
+                try:
+                    target_dir = plan.target.parent
+                    if target_dir.exists():
+                        if not target_dir.is_dir() or target_dir.is_symlink():
+                            raise OSError(f"unsafe target folder: {target_dir}")
+                    else:
+                        target_dir.mkdir()
+
+                    preferred_target = target_dir / plan.source.name
+                    actual_target = available_file_target(preferred_target, runtime_reserved)
+                    runtime_reserved.add(actual_target)
+
+                    os.rename(plan.source, actual_target)
+                    moved += 1
+                    write_rename_log(
+                        rename_log_handle,
+                        rename_run_id,
+                        "MOVED",
+                        plan,
+                        target=actual_target,
+                    )
+                    print(f"[MOVED] {plan.source} -> {actual_target}")
+                except OSError as exc:
+                    errors += 1
+                    write_rename_log(
+                        rename_log_handle,
+                        rename_run_id,
+                        "ERROR",
+                        plan,
+                        error=exc,
+                    )
+                    print(
+                        f"[ERROR] Could not move {plan.source}: {exc}",
+                        file=sys.stderr,
+                    )
         finally:
             rename_log_handle.close()
 
     print()
     print("Summary")
     print("=======")
-    print(f"Folders examined    : {len(plans) + build_skipped}")
+    print(f"Items examined      : {len(plans) + len(root_file_plans) + build_skipped}")
     print(f"Already normalized  : {already_normalized}")
     print(f"Would rename        : {len(actionable) if not args.write else 0}")
+    print(f"Would move          : {len(root_actionable) if not args.write else 0}")
     print(f"Renamed             : {renamed}")
-    print(f"No folder           : {len(no_folder)}")
+    print(f"Moved               : {moved}")
     print(f"Unsafe names        : {len(unsafe_names)}")
     print(f"Suspicious matches  : {len(suspicious)}")
     print(f"Needs review        : {len(review)}")
@@ -800,7 +955,7 @@ def main() -> int:
         print(f"Rename audit log    : {rename_log_path}")
 
     if not args.write:
-        print("\nDRY RUN ONLY. Nothing was renamed. Add --write to apply folder renames.")
+        print("\nDRY RUN ONLY. Nothing was changed. Add --write to apply folder renames and root-file moves.")
 
     return 1 if errors else 0
 
