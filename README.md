@@ -16,7 +16,7 @@ Example Movie (2016)/
 └── video.mkv
 ```
 
-**Only the containing folder is renamed. Files inside it keep their original names.**
+Existing movie folders are normalized in place. Plex-indexed movie files found directly in a library root can also be placed into their canonical movie folder. Movie filenames themselves are preserved unless a filename collision requires a numbered suffix.
 
 ## Safety model
 
@@ -27,9 +27,12 @@ PlexLibraryMaintainer is deliberately conservative:
 - Dry-run is the default.
 - No folder is renamed unless `--write` is explicitly supplied.
 - Only the **first directory immediately below a selected library root** is ever considered for renaming.
-- Files and nested folders inside movie folders are never renamed or moved.
+- Files and nested folders inside existing movie folders are never renamed or moved by M1.
 - Library roots are never renamed.
-- Destination folders are never merged or overwritten.
+- M2 can move a Plex-indexed movie file that lives directly in the library root into its canonical movie folder.
+- If that canonical folder already exists, M2 reuses it.
+- Existing files are never overwritten. If the same filename already exists in the target folder, M2 uses the first free numbered name such as `video (1).mkv`, then `video (2).mkv`.
+- Destination folders are never merged by the M1 folder-renaming operation.
 - A trailing Plex-style `{edition-...}` marker already present in the source
   folder is preserved literally in the target name.
 - M1 applies only two explicit title substitutions: `:` → `;` and `?` → `¿`.
@@ -137,17 +140,17 @@ both media files map to the single source folder:
 Only that folder may be renamed. `CD1`, `CD2`, the video files, subtitles, and
 anything else below it are left untouched.
 
-If a movie file is directly in the library root, M1 reports it as
-`[NO FOLDER]` and skips it. Creating or selecting a destination folder for such
-files is intentionally deferred to a later milestone.
+Movie files that Plex indexes directly in the library root are handled separately by M2. M1 still never treats the library root itself as a movie folder.
 
-### Apply the renames
+### Apply changes
 
 Only after reviewing the dry-run:
 
 ```bash
 python3 plex_library_maintainer.py --write
 ```
+
+This applies both safe M1 folder renames and safe M2 root-file moves.
 
 All write runs append to one mandatory audit history:
 
@@ -166,7 +169,7 @@ is interrupted. If the audit log cannot be opened for append, the script refuses
 to perform any rename. The `*.log` pattern is ignored by Git, so this local
 history is not committed.
 
-The only filesystem operation performed in M1 is renaming the movie's first directory immediately below the selected library root from its current name to:
+The filesystem operation performed in M1 is renaming the movie's first directory immediately below the selected library root from its current name to:
 
 ```text
 <Plex title> (<Plex year>)
@@ -188,7 +191,7 @@ exactly as written:
 
 ```text
 Example Movie (2016) {edition-Director's Cut}
--> Alien (1979) {edition-Director's Cut}
+-> Example Movie (2016) {edition-Director's Cut}
 
 Example Movie - old folder (2016) {edition-Special Edition}
 -> Example Movie (2016) {edition-Special Edition}
@@ -212,6 +215,29 @@ Example Movie (2016)/
 
 while files inside remain untouched.
 
+### M2 root-file organization
+
+When Plex indexes a movie file that is directly in a selected movie library root, M2 plans a move into the same canonical folder format used by M1:
+
+```text
+/library/Movies/video.mkv
+-> /library/Movies/Example Movie (2016)/video.mkv
+```
+
+If the canonical folder already exists, it is reused rather than treated as a collision.
+
+If the target folder already contains a file with the same name, M2 never overwrites it. The moved file receives the first free numbered suffix before the extension:
+
+```text
+video.mkv
+video (1).mkv
+video (2).mkv
+```
+
+M2 moves only the Plex-indexed movie file itself. It does not guess which unrelated files in the library root might be sidecars. Unsafe or suspicious metadata cases are skipped for review, just as with M1.
+
+Dry-run output uses `[MOVE]`; successful write-mode operations are recorded as `MOVED` in the same cumulative audit history.
+
 ### Override the database location
 
 ```bash
@@ -234,7 +260,6 @@ The tool refuses to guess when a rename is not clearly safe. Examples include:
 
 - Plex metadata without a title or year.
 - A selected library that is not a movie library.
-- A movie file stored directly in the library root (reported as `[NO FOLDER]` in M1).
 - A media path that is not contained by any configured root for its Plex library.
 - A missing or inaccessible source folder.
 - A symlinked movie folder.
@@ -254,10 +279,10 @@ The tool refuses to guess when a rename is not clearly safe. Examples include:
 
 These cases are reported instead of being modified.
 
-For M1 reporting, these categories are kept separate:
+For reporting, these categories are kept separate:
 
-- `[NO FOLDER]`: a movie file is directly in the library root. This is a known
-  structural case, not a generic review error.
+- `[MOVE]`: M2 proposes moving a Plex-indexed movie file from the library root
+  into its canonical movie folder.
 - `[UNSAFE NAME]`: Plex's title would produce a target that M1 refuses to
   create after the two explicit title substitutions.
 - `[SUSPICIOUS]`: Plex metadata may be correct, translated, transliterated, or
@@ -268,8 +293,7 @@ For M1 reporting, these categories are kept separate:
   a target folder already exists. Collisions are reported once per target and
   list every source folder involved. M1 never chooses a winner or merges them.
 
-The summary therefore reports `No folder`, `Unsafe names`,
-`Suspicious matches`, `Needs review`, and `Collision groups` independently.
+The summary reports planned and completed folder renames and root-file moves separately, alongside `Unsafe names`, `Suspicious matches`, `Needs review`, and `Collision groups`.
 
 ## Plex after a rename
 
@@ -279,7 +303,7 @@ Renaming a movie folder changes its filesystem path. Plex may temporarily show t
 
 - It does not rename movie files.
 - It does not rename subtitle files.
-- It does not move files between folders.
+- It does not move files between existing movie folders. M2 only moves Plex-indexed movie files that are directly in a selected library root into their canonical movie folder.
 - It does not merge folders.
 - It does not use fuzzy title parsing to choose or rewrite titles. A conservative
   text-similarity check is used only to veto suspicious renames.
