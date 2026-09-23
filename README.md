@@ -2,7 +2,7 @@
 
 Conservative maintenance tools for Plex libraries.
 
-The first tool in this repository normalizes **movie folder names** from Plex's own metadata. Instead of trying to reverse release-style names with fuzzy rules, it asks Plex what the movie is and uses the canonical title and year that Plex already knows.
+The first tool in this repository normalizes **movie folder names** from Plex's own metadata. Instead of trying to reverse existing names with fuzzy rules, it asks Plex what the movie is and uses the canonical title and year that Plex already knows when a year is available.
 
 Example:
 
@@ -169,10 +169,11 @@ is interrupted. If the audit log cannot be opened for append, the script refuses
 to perform any rename. The `*.log` pattern is ignored by Git, so this local
 history is not committed.
 
-The filesystem operation performed in M1 is renaming the movie's first directory immediately below the selected library root from its current name to:
+The filesystem operation performed in M1 is renaming the movie's first directory immediately below the selected library root to the Plex title, adding the year when Plex provides one:
 
 ```text
 <Plex title> (<Plex year>)
+<Plex title>
 ```
 
 Before building that folder name, M1 applies only these explicit conventions:
@@ -217,11 +218,14 @@ while files inside remain untouched.
 
 ### M2 root-file organization
 
-When Plex indexes a movie file that is directly in a selected movie library root, M2 plans a move into the same canonical folder format used by M1:
+When Plex indexes a movie file that is directly in a selected movie library root, M2 plans a move into the same canonical folder format used by M1. If Plex has no year, the folder uses the title only:
 
 ```text
 /library/Movies/video.mkv
 -> /library/Movies/Example Movie (2016)/video.mkv
+
+/library/Movies/another-video.mkv
+-> /library/Movies/Example Documentary/another-video.mkv
 ```
 
 If the canonical folder already exists, it is reused rather than treated as a collision.
@@ -258,7 +262,7 @@ Command-line path mappings replace mappings from `config.json`.
 
 The tool refuses to guess when a rename is not clearly safe. Examples include:
 
-- Plex metadata without a title or year.
+- Plex metadata without a title. A missing year is allowed; the canonical folder uses only the title.
 - A selected library that is not a movie library.
 - A media path that is not contained by any configured root for its Plex library.
 - A missing or inaccessible source folder.
@@ -269,9 +273,11 @@ The tool refuses to guess when a rename is not clearly safe. Examples include:
 - Two source folders that would normalize to the same destination.
 - A destination folder that already exists.
 - A target name that remains unsafe after the explicit `:` → `;` and
-  `?` → `¿` substitutions. M1 conservatively rejects remaining path
-  separators/reserved characters, control characters, DSM-reserved `._`
-  prefixes, and unsafe trailing space/dot cases.
+  `?` → `¿` substitutions. When no year is available, trailing spaces and
+  dots are removed from the Plex title because they would become the final
+  character of the folder name. Remaining path separators/reserved characters,
+  control characters, DSM-reserved `._` prefixes, and unsafe trailing
+  space/dot cases are rejected.
 - A proposed rename whose current folder name and Plex title have no whole-title
   containment, no shared meaningful token, and low normalized character
   similarity. This check is only a safety veto: it never guesses or changes a
