@@ -1353,15 +1353,19 @@ def plan_collision_merges(plans: list[FolderPlan]):
                     lines.append(f"    [M3 MOVE SUBTITLE] {source_path}")
                     lines.append(f"                      -> {target_path}")
                     planned_moves += 1
+                canonical_quarantine_dir = quarantine_root_for_target(target) / target.name
                 for subtitle_dir, target_paths in removals:
                     lines.append(
                         f"    [M3 VERIFY SUBS] {subtitle_dir}: verify "
-                        f"{len(target_paths)} moved subtitle(s) before removal"
+                        f"{len(target_paths)} moved subtitle(s) before quarantine"
                     )
-                    lines.append(
-                        f"    [M3 REMOVE SUBS] {subtitle_dir} "
-                        "(only after every planned subtitle is verified at destination)"
+                    subtitle_quarantine = available_directory_target(
+                        canonical_quarantine_dir / subtitle_dir.name,
+                        quarantine_reserved,
                     )
+                    quarantine_reserved.add(subtitle_quarantine)
+                    lines.append(f"    [M3 QUARANTINE SUBS] {subtitle_dir}")
+                    lines.append(f"                         -> {subtitle_quarantine}")
                 continue
 
             videos: list[Path] = classified["videos"]
@@ -1431,11 +1435,7 @@ def plan_collision_merges(plans: list[FolderPlan]):
                 ]
                 lines.append(
                     f"    [M3 VERIFY SUBS] {subtitle_dir}: verify "
-                    f"{len(moved_targets)} moved subtitle(s) before removal"
-                )
-                lines.append(
-                    f"    [M3 REMOVE SUBS] {subtitle_dir} "
-                    "(only after every planned subtitle is verified at destination)"
+                    f"{len(moved_targets)} moved subtitle(s) before source quarantine"
                 )
 
             for leftover in leftovers:
