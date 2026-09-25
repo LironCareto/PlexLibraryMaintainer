@@ -10,6 +10,7 @@ in the library root into their canonical movie folder.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import re
@@ -2629,6 +2630,7 @@ def print_duplicate_report(
     probe_media: bool,
     ffprobe_path: str | None = None,
     ffmpeg_path: str | None = None,
+    tsv_path: Path | None = None,
 ) -> int:
     groups = duplicate_movie_groups(conn, libraries, path_maps)
     version_count = sum(len(group["versions"]) for group in groups)
@@ -2677,6 +2679,8 @@ def print_duplicate_report(
 
     probe_errors = 0
     probe_error_details: list[str] = []
+    tsv_rows: list[dict[str, object]] = []
+    detailed_console = tsv_path is None
 
     for group in groups:
         title = display_title_year(group["title"], group["year"])
@@ -2684,23 +2688,63 @@ def print_duplicate_report(
             group["versions"][media_id]
             for media_id in sorted(group["versions"])
         ]
-        print(f"[DUPLICATE] [{group['library'].name}] {title}")
-        print(
-            f"  Plex metadata id {group['metadata_id']} | "
-            f"{len(versions)} media versions"
-        )
+        if detailed_console:
+            print(f"[DUPLICATE] [{group['library'].name}] {title}")
+            print(
+                f"  Plex metadata id {group['metadata_id']} | "
+                f"{len(versions)} media versions"
+            )
 
         if not probe_media:
             for index, version in enumerate(versions, start=1):
-                print(f"  {index}. media id {version['media_id']}")
+                sizes = []
                 for path in version["files"]:
                     try:
-                        size = path.stat().st_size if path.is_file() else None
+                        sizes.append(path.stat().st_size if path.is_file() else None)
                     except OSError:
-                        size = None
-                    print(f"     {path}")
-                    print(f"       size: {human_size(size)}")
-            print()
+                        sizes.append(None)
+                total_size = (
+                    sum(size for size in sizes if size is not None)
+                    if any(size is not None for size in sizes)
+                    else None
+                )
+                tsv_rows.append(
+                    {
+                        "library": group["library"].name,
+                        "title": group["title"],
+                        "year": group["year"] or "",
+                        "metadata_id": group["metadata_id"],
+                        "version_count": len(versions),
+                        "media_id": version["media_id"],
+                        "assessment": "",
+                        "cut_cluster": "",
+                        "cut_class": "",
+                        "files": " | ".join(str(path) for path in version["files"]),
+                        "file_count": len(version["files"]),
+                        "size_bytes": total_size if total_size is not None else "",
+                        "size": human_size(total_size),
+                        "duration_seconds": "",
+                        "duration": "",
+                        "bitrate_mbps": "",
+                        "resolution": "",
+                        "video_codec": "",
+                        "video_profile": "",
+                        "bit_depth": "",
+                        "hdr": "",
+                        "audio": "",
+                        "subtitles": "",
+                        "multipart": "",
+                        "mixed_video": "",
+                        "probe_errors": "",
+                    }
+                )
+                if detailed_console:
+                    print(f"  {index}. media id {version['media_id']}")
+                    for path, size in zip(version["files"], sizes):
+                        print(f"     {path}")
+                        print(f"       size: {human_size(size)}")
+            if detailed_console:
+                print()
             continue
 
         summaries = [
@@ -2724,55 +2768,124 @@ def print_duplicate_report(
         for index, version in enumerate(summaries, start=1):
             cluster_index, cluster_label = cluster_by_media_id[version["media_id"]]
             assessment = labels[version["media_id"]]
-            print(
-                f"  {index}. [{assessment}] media id {version['media_id']} "
-                f"| cluster {cluster_index} [{cluster_label}]"
+            video = version["video"] or {}
+            width = video.get("width")
+            height = video.get("height")
+            resolution = f"{width}x{height}" if width and height else ""
+            bitrate_mbps = (
+                version["effective_bitrate"] / 1_000_000
+                if version["effective_bitrate"] is not None
+                else ""
             )
-            for path in version["files"]:
-                print(f"     {path}")
-            print(
-                f"       size: {human_size(version['size'])} | "
-                f"duration: {format_duration(version['duration'])} | "
-                f"bitrate: "
-                + (
-                    f"{version['effective_bitrate'] / 1_000_000:.2f} Mbps"
-                    if version["effective_bitrate"] is not None
-                    else "?"
+            tsv_rows.append(
+                {
+                    "library": group["library"].name,
+                    "title": group["title"],
+                    "year": group["year"] or "",
+                    "metadata_id": group["metadata_id"],
+                    "version_count": len(versions),
+                    "media_id": version["media_id"],
+                    "assessment": assessment,
+                    "cut_cluster": cluster_index,
+                    "cut_class": cluster_label,
+                    "files": " | ".join(str(path) for path in version["files"]),
+                    "file_count": len(version["files"]),
+                    "size_bytes": version["size"] if version["size"] is not None else "",
+                    "size": human_size(version["size"]),
+                    "duration_seconds": (
+                        f"{version['duration']:.3f}"
+                        if version["duration"] is not None
+                        else ""
+                    ),
+                    "duration": format_duration(version["duration"]),
+                    "bitrate_mbps": (
+                        f"{bitrate_mbps:.3f}" if bitrate_mbps != "" else ""
+                    ),
+                    "resolution": resolution,
+                    "video_codec": video.get("codec") or "",
+                    "video_profile": video.get("profile") or "",
+                    "bit_depth": video.get("bit_depth") or "",
+                    "hdr": video.get("hdr") or "",
+                    "audio": describe_audio(version),
+                    "subtitles": describe_subtitles(version),
+                    "multipart": "yes" if version["multipart"] else "no",
+                    "mixed_video": "yes" if version["mixed_video"] else "no",
+                    "probe_errors": " | ".join(version["errors"]),
+                }
+            )
+
+            if detailed_console:
+                print(
+                    f"  {index}. [{assessment}] media id {version['media_id']} "
+                    f"| cluster {cluster_index} [{cluster_label}]"
                 )
-            )
-            print(f"       video: {describe_video(version)}")
-            print(f"       audio: {describe_audio(version)}")
-            print(f"       subs : {describe_subtitles(version)}")
-            if version["multipart"]:
-                print(f"       note : MULTIPART ({len(version['files'])} files); auto-ranking disabled")
-            if version["mixed_video"]:
-                print("       note : mixed video characteristics across parts; auto-ranking disabled")
+                for path in version["files"]:
+                    print(f"     {path}")
+                print(
+                    f"       size: {human_size(version['size'])} | "
+                    f"duration: {format_duration(version['duration'])} | "
+                    f"bitrate: "
+                    + (
+                        f"{version['effective_bitrate'] / 1_000_000:.2f} Mbps"
+                        if version["effective_bitrate"] is not None
+                        else "?"
+                    )
+                )
+                print(f"       video: {describe_video(version)}")
+                print(f"       audio: {describe_audio(version)}")
+                print(f"       subs : {describe_subtitles(version)}")
+                if version["multipart"]:
+                    print(f"       note : MULTIPART ({len(version['files'])} files); auto-ranking disabled")
+                if version["mixed_video"]:
+                    print("       note : mixed video characteristics across parts; auto-ranking disabled")
             for error in version["errors"]:
                 probe_errors += 1
                 probe_error_details.append(
                     f"{title} | media id {version['media_id']} | {error}"
                 )
-                print(f"       [PROBE ERROR] {error}")
+                if detailed_console:
+                    print(f"       [PROBE ERROR] {error}")
 
-        print("  Group assessment:")
-        for cluster_index, cluster in enumerate(clusters, start=1):
-            if len(cluster) > 1:
-                durations = [version["duration"] for version in cluster]
-                spread = max(durations) - min(durations)
-                print(
-                    f"    cluster {cluster_index}: SAME CUT by duration "
-                    f"({len(cluster)} versions, spread {spread:.2f}s)"
-                )
-            else:
-                version = cluster[0]
-                if version["duration"] is None:
-                    print(f"    cluster {cluster_index}: REVIEW (duration unavailable)")
-                else:
+        if detailed_console:
+            print("  Group assessment:")
+            for cluster_index, cluster in enumerate(clusters, start=1):
+                if len(cluster) > 1:
+                    durations = [version["duration"] for version in cluster]
+                    spread = max(durations) - min(durations)
                     print(
-                        f"    cluster {cluster_index}: DIFFERENT CUT candidate "
-                        f"({format_duration(version['duration'])})"
+                        f"    cluster {cluster_index}: SAME CUT by duration "
+                        f"({len(cluster)} versions, spread {spread:.2f}s)"
                     )
-        print()
+                else:
+                    version = cluster[0]
+                    if version["duration"] is None:
+                        print(f"    cluster {cluster_index}: REVIEW (duration unavailable)")
+                    else:
+                        print(
+                            f"    cluster {cluster_index}: DIFFERENT CUT candidate "
+                            f"({format_duration(version['duration'])})"
+                        )
+            print()
+
+    if tsv_path is not None:
+        fieldnames = [
+            "library", "title", "year", "metadata_id", "version_count",
+            "media_id", "assessment", "cut_cluster", "cut_class", "files",
+            "file_count", "size_bytes", "size", "duration_seconds", "duration",
+            "bitrate_mbps", "resolution", "video_codec", "video_profile",
+            "bit_depth", "hdr", "audio", "subtitles", "multipart",
+            "mixed_video", "probe_errors",
+        ]
+        tsv_path.parent.mkdir(parents=True, exist_ok=True)
+        with tsv_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=fieldnames,
+                delimiter="\t",
+                lineterminator="\n",
+            )
+            writer.writeheader()
+            writer.writerows(tsv_rows)
 
     print("M4 duplicate summary")
     print("====================")
@@ -2782,6 +2895,9 @@ def print_duplicate_report(
     if probe_media:
         print(f"Probe binary        : {probe_binary}")
     print(f"Probe errors        : {probe_errors}")
+    if tsv_path is not None:
+        print(f"TSV report          : {tsv_path}")
+        print(f"TSV rows            : {len(tsv_rows)}")
     if probe_error_details:
         print()
         print("Probe error details")
@@ -2963,6 +3079,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--tsv",
+        type=Path,
+        metavar="FILE",
+        help=(
+            "With --report duplicates, write one Google-Sheets-friendly TSV row per "
+            "media version. Detailed per-movie console output is suppressed."
+        ),
+    )
+    parser.add_argument(
         "--write",
         action="store_true",
         help="Actually apply the selected write operation. Without this flag nothing is changed.",
@@ -3014,6 +3139,13 @@ def main() -> int:
     if args.probe_media and args.report != "duplicates":
         print(
             "[FATAL] --probe-media requires --report duplicates.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.tsv is not None and args.report != "duplicates":
+        print(
+            "[FATAL] --tsv requires --report duplicates.",
             file=sys.stderr,
         )
         return 2
@@ -3106,6 +3238,7 @@ def main() -> int:
                 probe_media=args.probe_media,
                 ffprobe_path=ffprobe_path,
                 ffmpeg_path=ffmpeg_path,
+                tsv_path=args.tsv,
             )
 
         plans, root_file_plans, build_review, unsafe_names, build_skipped = build_plans(
