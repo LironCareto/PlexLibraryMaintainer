@@ -1602,6 +1602,7 @@ def build_collision_execution_plan(plans: list[FolderPlan], selector: str):
         "target": target,
         "create_target": create_target,
         "quarantine_root": quarantine_root_for_target(target),
+        "metadata_plan": group[0],
         "actions": actions,
     }
 
@@ -1614,7 +1615,7 @@ def print_collision_execution_plan(execution) -> None:
     print("===================================")
     print(f"Selected collision : {target}")
     print("Scope              : this collision only")
-    print("Execution          : DISABLED")
+    print("Execution          : single-collision write requested")
     print()
 
     if execution["create_target"]:
@@ -1644,6 +1645,189 @@ def print_collision_execution_plan(execution) -> None:
             print(f"                         -> {quarantine_target}")
 
         print()
+
+
+def write_m3_audit(handle, run_id: str, status: str, source: Path, target: Path | None, plan):
+    record = {
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "status": status,
+        "run_id": run_id,
+        "source": str(source),
+        "target": str(target) if target is not None else None,
+        "library": plan.library_name,
+        "title": plan.title,
+        "year": plan.year,
+    }
+    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    handle.flush()
+
+
+def execute_collision_execution_plan(execution) -> int:
+    """Execute one preflighted collision. Subs/Subtitles writes remain fail-closed."""
+    target: Path = execution["target"]
+    metadata_plan = execution["metadata_plan"]
+    actions = execution["actions"]
+
+    for action in actions:
+        if action["subtitle_dirs"]:
+            print(
+                f"[FATAL] M3c write is not enabled yet for Subs/Subtitles: "
+                f"{action['subtitle_dirs'][0]}",
+                file=sys.stderr,
+            )
+            return 2
+
+    frozen = {}
+    try:
+        for action in actions:
+            for source_path, target_path, _ in action["moves"]:
+                if (
+                    not source_path.exists()
+                    or not source_path.is_file()
+                    or source_path.is_symlink()
+                ):
+                    raise OSError(f"planned source changed or disappeared: {source_path}")
+                if target_path.exists():
+                    raise OSError(f"refusing to overwrite existing target: {target_path}")
+
+                stat = source_path.stat()
+                frozen[source_path] = (stat.st_size, stat.st_mtime_ns)
+
+        if execution["create_target"] and target.exists():
+            raise OSError(f"canonical target appeared after preflight: {target}")
+    except OSError as exc:
+        print(f"[FATAL] M3c final preflight failed: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        log_path, log_handle, run_id = create_rename_log()
+    except OSError as exc:
+        print(f"[FATAL] Could not create audit log; refusing M3c write: {exc}", file=sys.stderr)
+        return 2
+
+    moved = 0
+    quarantined = 0
+    errors = 0
+
+    try:
+        if execution["create_target"]:
+            try:
+                target.mkdir()
+                write_m3_audit(
+                    log_handle, run_id, "M3_MKDIR", target, target, metadata_plan
+                )
+                print(f"[M3 CREATED] {target}")
+            except OSError as exc:
+                errors += 1
+                print(f"[M3 ERROR] Could not create {target}: {exc}", file=sys.stderr)
+                return 1
+
+        for action in actions:
+            if action["canonical"]:
+                continue
+
+            action_failed = False
+            for source_path, target_path, kind in action["moves"]:
+                try:
+                    if (
+                        not source_path.exists()
+                        or not source_path.is_file()
+                        or source_path.is_symlink()
+                    ):
+                        raise OSError(f"source changed since preflight: {source_path}")
+
+                    stat = source_path.stat()
+                    if (stat.st_size, stat.st_mtime_ns) != frozen[source_path]:
+                        raise OSError(f"source changed since preflight: {source_path}")
+                    if target_path.exists():
+                        raise OSError(f"refusing to overwrite existing target: {target_path}")
+
+                    os.rename(source_path, target_path)
+
+                    if (
+                        source_path.exists()
+                        or not target_path.exists()
+                        or not target_path.is_file()
+                        or target_path.stat().st_size != frozen[source_path][0]
+                    ):
+                        raise OSError(f"move verification failed: {target_path}")
+
+                    moved += 1
+                    write_m3_audit(
+                        log_handle,
+                        run_id,
+                        f"M3_MOVED_{kind}",
+                        source_path,
+                        target_path,
+                        metadata_plan,
+                    )
+                    print(f"[M3 MOVED {kind}] {source_path} -> {target_path}")
+                except OSError as exc:
+                    errors += 1
+                    action_failed = True
+                    write_m3_audit(
+                        log_handle,
+                        run_id,
+                        "M3_ERROR",
+                        source_path,
+                        target_path,
+                        metadata_plan,
+                    )
+                    print(f"[M3 ERROR] {exc}", file=sys.stderr)
+                    break
+
+            if action_failed:
+                break
+
+            source = action["source"]
+            quarantine_target = action["quarantine_target"]
+            try:
+                quarantine_target.parent.mkdir(parents=True, exist_ok=True)
+                if quarantine_target.exists():
+                    raise OSError(
+                        f"refusing to overwrite quarantine target: {quarantine_target}"
+                    )
+                if not source.exists() or not source.is_dir() or source.is_symlink():
+                    raise OSError(f"unsafe source shell before quarantine: {source}")
+
+                os.rename(source, quarantine_target)
+
+                if source.exists() or not quarantine_target.is_dir():
+                    raise OSError(f"quarantine verification failed: {quarantine_target}")
+
+                quarantined += 1
+                write_m3_audit(
+                    log_handle,
+                    run_id,
+                    "M3_QUARANTINED",
+                    source,
+                    quarantine_target,
+                    metadata_plan,
+                )
+                print(f"[M3 QUARANTINED] {source} -> {quarantine_target}")
+            except OSError as exc:
+                errors += 1
+                write_m3_audit(
+                    log_handle,
+                    run_id,
+                    "M3_ERROR",
+                    source,
+                    quarantine_target,
+                    metadata_plan,
+                )
+                print(f"[M3 ERROR] {exc}", file=sys.stderr)
+                break
+    finally:
+        log_handle.close()
+
+    print()
+    print("M3c summary")
+    print("===========")
+    print(f"Files moved         : {moved}")
+    print(f"Sources quarantined : {quarantined}")
+    print(f"Errors              : {errors}")
+    print(f"Audit log           : {log_path}")
+    return 1 if errors else 0
 
 
 def validate_plans(
@@ -1894,11 +2078,7 @@ def main() -> int:
             return 2
 
         print_collision_execution_plan(execution)
-        print(
-            "[FATAL] M3c execution is not wired yet; preflight completed without changes.",
-            file=sys.stderr,
-        )
-        return 2
+        return execute_collision_execution_plan(execution)
 
     actionable, validation_review, collision_reports, already_normalized = validate_plans(plans)
     m3_analysis_reports = analyze_collision_plans(plans) if args.analyze_collisions else []
