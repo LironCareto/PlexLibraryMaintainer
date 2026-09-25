@@ -249,6 +249,20 @@ def comparison_text(value: str) -> str:
     return " ".join(value.split())
 
 
+def conflicting_source_years(plan: FolderPlan) -> set[int]:
+    """Return explicit parenthesized source years that disagree with Plex."""
+    if plan.year is None:
+        return set()
+
+    source_years = {
+        int(match)
+        for match in re.findall(r"\(((?:19|20)\d{2})\)", plan.comparison_name)
+    }
+    if source_years and plan.year not in source_years:
+        return source_years
+    return set()
+
+
 def suspicious_title_match(plan: FolderPlan):
     """Return a similarity score when a proposed mapping looks suspicious.
 
@@ -256,13 +270,8 @@ def suspicious_title_match(plan: FolderPlan):
     the source must agree with Plex. Title similarity is then checked using
     whole-phrase containment, meaningful shared tokens, or character similarity.
     """
-    if plan.year is not None:
-        source_years = {
-            int(match)
-            for match in re.findall(r"\(((?:19|20)\d{2})\)", plan.comparison_name)
-        }
-        if source_years and plan.year not in source_years:
-            return 0.0
+    if conflicting_source_years(plan):
+        return 0.0
 
     year_token = str(plan.year) if plan.year is not None else None
     source_tokens = [
@@ -1513,22 +1522,40 @@ def selected_collision(plans: list[FolderPlan], selector: str):
     return matches[0]
 
 
-def build_collision_execution_plan(plans: list[FolderPlan], selector: str):
+def build_collision_execution_plan(
+    plans: list[FolderPlan],
+    selector: str,
+    accept_title_mismatch: bool = False,
+):
     """Build a complete, read-only preflight plan for one selected collision."""
     target, group = selected_collision(plans, selector)
 
-    suspicious_sources = []
+    year_conflicts = []
     for plan in group:
-        score = suspicious_title_match(plan)
-        if score is not None:
-            suspicious_sources.append(
-                f"{plan.source} -> {display_title_year(plan.title, plan.year)}"
+        conflicts = conflicting_source_years(plan)
+        if conflicts:
+            years = ", ".join(str(year) for year in sorted(conflicts))
+            year_conflicts.append(
+                f"{plan.source} has source year(s) {years}, Plex year {plan.year}"
             )
-    if suspicious_sources:
+    if year_conflicts:
         raise ValueError(
-            "collision identity guardrail rejected: "
-            + "; ".join(suspicious_sources)
+            "collision year guardrail rejected: " + "; ".join(year_conflicts)
         )
+
+    if not accept_title_mismatch:
+        suspicious_sources = []
+        for plan in group:
+            score = suspicious_title_match(plan)
+            if score is not None:
+                suspicious_sources.append(
+                    f"{plan.source} -> {display_title_year(plan.title, plan.year)}"
+                )
+        if suspicious_sources:
+            raise ValueError(
+                "collision identity guardrail rejected: "
+                + "; ".join(suspicious_sources)
+            )
 
     sources = sorted({plan.source for plan in group}, key=str)
 
@@ -1672,6 +1699,7 @@ def build_collision_execution_plan(plans: list[FolderPlan], selector: str):
         "create_target": create_target,
         "quarantine_root": quarantine_root_for_target(target),
         "metadata_plan": group[0],
+        "accept_title_mismatch": accept_title_mismatch,
         "actions": actions,
     }
 
@@ -1742,6 +1770,8 @@ def print_collision_execution_plan(execution) -> None:
     print(f"Selected collision : {target}")
     print("Scope              : this collision only")
     print("Execution          : single-collision write requested")
+    if execution.get("accept_title_mismatch"):
+        print("Title identity     : explicitly accepted for this collision")
     print()
 
     if execution["create_target"]:
@@ -2203,6 +2233,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--accept-title-mismatch",
+        action="store_true",
+        help=(
+            "For one explicit --merge-collision only, accept a title/language mismatch "
+            "that the automatic identity guardrail rejects. Explicit source/Plex year "
+            "conflicts remain blocked."
+        ),
+    )
+    parser.add_argument(
         "--write",
         action="store_true",
         help="Actually apply the selected write operation. Without this flag nothing is changed.",
@@ -2223,6 +2262,13 @@ def main() -> int:
     if args.merge_collision and args.merge_ready_collisions:
         print(
             "[FATAL] --merge-collision and --merge-ready-collisions are mutually exclusive.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.accept_title_mismatch and not args.merge_collision:
+        print(
+            "[FATAL] --accept-title-mismatch requires one explicit --merge-collision.",
             file=sys.stderr,
         )
         return 2
@@ -2318,7 +2364,11 @@ def main() -> int:
 
     if args.merge_collision:
         try:
-            execution = build_collision_execution_plan(plans, args.merge_collision)
+            execution = build_collision_execution_plan(
+                plans,
+                args.merge_collision,
+                accept_title_mismatch=args.accept_title_mismatch,
+            )
         except (OSError, ValueError) as exc:
             print(f"[FATAL] M3c preflight refused the operation: {exc}", file=sys.stderr)
             return 2
