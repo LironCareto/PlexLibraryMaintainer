@@ -288,6 +288,11 @@ def suspicious_title_match(plan: FolderPlan):
     if source_meaningful & title_meaningful:
         return None
 
+    source_words = {token for token in source_tokens if len(token) >= 3}
+    title_words = {token for token in title_tokens if len(token) >= 3}
+    if len(source_words & title_words) >= 2:
+        return None
+
     score = SequenceMatcher(None, source_text, title_text).ratio()
     if score >= SUSPICIOUS_SIMILARITY_THRESHOLD:
         return None
