@@ -2583,6 +2583,25 @@ def describe_subtitles(version) -> str:
     return ", ".join(items)
 
 
+def find_ffprobe():
+    """Locate ffprobe in PATH or common package locations."""
+    found = shutil.which("ffprobe")
+    if found:
+        return found
+
+    candidates = [
+        Path("/bin/ffprobe"),
+        Path("/usr/bin/ffprobe"),
+        Path("/usr/local/bin/ffprobe"),
+    ]
+    candidates.extend(sorted(Path("/var/packages").glob("*/target/bin/ffprobe")))
+
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
 def print_duplicate_report(
     conn: sqlite3.Connection,
     libraries: list[Library],
@@ -2617,10 +2636,10 @@ def print_duplicate_report(
 
     ffprobe = None
     if probe_media:
-        ffprobe = shutil.which("ffprobe")
+        ffprobe = find_ffprobe()
         if ffprobe is None:
             print(
-                "[FATAL] --probe-media requested but ffprobe is not available in PATH.",
+                "[FATAL] --probe-media requested but ffprobe could not be found.",
                 file=sys.stderr,
             )
             return 2
