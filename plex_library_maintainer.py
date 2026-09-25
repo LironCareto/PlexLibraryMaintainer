@@ -2676,6 +2676,7 @@ def print_duplicate_report(
         return 0
 
     probe_errors = 0
+    probe_error_details: list[str] = []
 
     for group in groups:
         title = display_title_year(group["title"], group["year"])
@@ -2748,6 +2749,9 @@ def print_duplicate_report(
                 print("       note : mixed video characteristics across parts; auto-ranking disabled")
             for error in version["errors"]:
                 probe_errors += 1
+                probe_error_details.append(
+                    f"{title} | media id {version['media_id']} | {error}"
+                )
                 print(f"       [PROBE ERROR] {error}")
 
         print("  Group assessment:")
@@ -2778,6 +2782,12 @@ def print_duplicate_report(
     if probe_media:
         print(f"Probe binary        : {probe_binary}")
     print(f"Probe errors        : {probe_errors}")
+    if probe_error_details:
+        print()
+        print("Probe error details")
+        print("===================")
+        for error in probe_error_details:
+            print(f"- {error}")
     return 1 if probe_errors else 0
 
 
