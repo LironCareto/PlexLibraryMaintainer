@@ -912,10 +912,10 @@ def subtitle_matches_video(subtitle: Path, video: Path) -> bool:
     if not tail:
         return True
 
-    # Accept only an explicit filename separator before a subtitle qualifier.
-    # This covers common ".eng", "-spa", "_eng", and " English" forms
-    # without fuzzy matching unrelated filenames.
-    return tail[0] in ".-_ "
+    # Accept a subtitle qualifier only when the boundary is explicit: either
+    # the qualifier itself starts with a separator, or the video stem already
+    # ends with one (for example "video_.mp4" + "video_eng.srt").
+    return tail[0] in ".-_ " or video_stem[-1] in ".-_ "
 
 
 def subtitle_tail_for_video(subtitle: Path, video: Path) -> str:
