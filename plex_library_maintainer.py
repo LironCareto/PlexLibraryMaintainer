@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 import unicodedata
@@ -249,13 +250,20 @@ def comparison_text(value: str) -> str:
 
 
 def suspicious_title_match(plan: FolderPlan):
-    """Return a similarity score when a proposed rename looks suspicious.
+    """Return a similarity score when a proposed mapping looks suspicious.
 
-    This is a guardrail, not a title parser. A rename is considered plausible
-    when the normalized Plex title appears as a whole phrase in the source
-    folder name, when the source phrase appears in the title, when they share a
-    meaningful token, or when their character similarity is reasonably high.
+    This is a guardrail, not a title parser. An explicit parenthesized year in
+    the source must agree with Plex. Title similarity is then checked using
+    whole-phrase containment, meaningful shared tokens, or character similarity.
     """
+    if plan.year is not None:
+        source_years = {
+            int(match)
+            for match in re.findall(r"\(((?:19|20)\d{2})\)", plan.comparison_name)
+        }
+        if source_years and plan.year not in source_years:
+            return 0.0
+
     year_token = str(plan.year) if plan.year is not None else None
     source_tokens = [
         token
@@ -275,8 +283,8 @@ def suspicious_title_match(plan: FolderPlan):
     if padded_title in padded_source or padded_source in padded_title:
         return None
 
-    source_meaningful = {token for token in source_tokens if len(token) >= 4}
-    title_meaningful = {token for token in title_tokens if len(token) >= 4}
+    source_meaningful = {token for token in source_tokens if len(token) >= 5}
+    title_meaningful = {token for token in title_tokens if len(token) >= 5}
     if source_meaningful & title_meaningful:
         return None
 
@@ -1485,6 +1493,20 @@ def selected_collision(plans: list[FolderPlan], selector: str):
 def build_collision_execution_plan(plans: list[FolderPlan], selector: str):
     """Build a complete, read-only preflight plan for one selected collision."""
     target, group = selected_collision(plans, selector)
+
+    suspicious_sources = []
+    for plan in group:
+        score = suspicious_title_match(plan)
+        if score is not None:
+            suspicious_sources.append(
+                f"{plan.source} -> {display_title_year(plan.title, plan.year)}"
+            )
+    if suspicious_sources:
+        raise ValueError(
+            "collision identity guardrail rejected: "
+            + "; ".join(suspicious_sources)
+        )
+
     sources = sorted({plan.source for plan in group}, key=str)
 
     if target.exists():
