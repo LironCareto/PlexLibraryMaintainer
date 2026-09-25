@@ -974,12 +974,29 @@ def inspect_subtitle_directory(subtitle_dir: Path, video: Path):
     return subtitle_tails, []
 
 
+def file_matches_video(path: Path, video: Path) -> bool:
+    """Return whether a sidecar filename is clearly associated with a video."""
+    base = path.name[:-len(path.suffix)] if path.suffix else path.name
+    base_folded = base.casefold()
+    video_folded = video.stem.casefold()
+    return base_folded == video_folded or base_folded.startswith(video_folded + ".")
+
+
+def associated_file_tail(path: Path, video: Path) -> str:
+    """Return the suffix that preserves an associated file's qualifiers."""
+    base = path.name[:-len(path.suffix)] if path.suffix else path.name
+    if base.casefold() == video.stem.casefold():
+        return path.suffix
+    return base[len(video.stem):] + path.suffix
+
+
 def merge_source_files(source: Path):
     """Classify a source folder for conservative M3b planning.
 
-    System metadata is ignored. Subs/Subtitles is accepted only when the source
-    contains exactly one recognized top-level video and every real item inside
-    the subtitle directory is a recognized subtitle file.
+    System metadata and unrelated leftovers do not block a safe merge because
+    the original source folder can later be moved intact to quarantine. Real
+    subdirectories, symlinks, ambiguous subtitles, and unsafe Subs/Subtitles
+    structures still block the source.
     """
     if not source.exists():
         return None, [f"source does not exist: {source}"]
@@ -990,7 +1007,9 @@ def merge_source_files(source: Path):
 
     videos: list[Path] = []
     subtitles: list[Path] = []
+    sidecars: list[Path] = []
     subtitle_dirs: list[Path] = []
+    leftovers: list[Path] = []
     blockers: list[str] = []
 
     try:
@@ -1023,9 +1042,9 @@ def merge_source_files(source: Path):
         elif suffix in SUBTITLE_EXTENSIONS:
             subtitles.append(path)
         elif suffix in GENERIC_SIDECAR_EXTENSIONS:
-            blockers.append(f"generic sidecar present: {path.name}")
+            sidecars.append(path)
         else:
-            blockers.append(f"unrecognized file present: {path.name}")
+            leftovers.append(path)
 
     if not videos:
         blockers.append("no recognized video files")
@@ -1084,19 +1103,44 @@ def merge_source_files(source: Path):
                 subtitle_to_video[subtitle] = video
                 subtitle_tails[subtitle] = tail
 
+    sidecar_to_video: dict[Path, Path] = {}
+    sidecar_tails: dict[Path, str] = {}
+
+    for sidecar in sidecars:
+        matches = [
+            video
+            for video in videos
+            if file_matches_video(sidecar, video)
+        ]
+        if len(matches) == 1:
+            video = matches[0]
+            sidecar_to_video[sidecar] = video
+            sidecar_tails[sidecar] = associated_file_tail(sidecar, video)
+        else:
+            leftovers.append(sidecar)
+
     folded_targets_by_video: dict[Path, dict[str, Path]] = defaultdict(dict)
-    for subtitle, video in subtitle_to_video.items():
-        tail = subtitle_tails[subtitle]
+    companions = []
+    companions.extend(
+        (subtitle, video, subtitle_tails[subtitle])
+        for subtitle, video in subtitle_to_video.items()
+    )
+    companions.extend(
+        (sidecar, video, sidecar_tails[sidecar])
+        for sidecar, video in sidecar_to_video.items()
+    )
+
+    for companion, video, tail in companions:
         target_name = f"{video.stem}{tail}"
         folded = target_name.casefold()
         previous = folded_targets_by_video[video].get(folded)
         if previous is not None:
             blockers.append(
-                "subtitles would produce duplicate target names: "
-                f"{previous} and {subtitle} -> {target_name}"
+                "associated files would produce duplicate target names: "
+                f"{previous} and {companion} -> {target_name}"
             )
         else:
-            folded_targets_by_video[video][folded] = subtitle
+            folded_targets_by_video[video][folded] = companion
 
     if blockers:
         return None, blockers
@@ -1106,18 +1150,22 @@ def merge_source_files(source: Path):
         "subtitles": list(subtitle_to_video),
         "subtitle_to_video": subtitle_to_video,
         "subtitle_tails": subtitle_tails,
+        "sidecars": list(sidecar_to_video),
+        "sidecar_to_video": sidecar_to_video,
+        "sidecar_tails": sidecar_tails,
         "subtitle_dirs": subtitle_dir_files,
+        "leftovers": sorted(leftovers, key=lambda item: item.name.casefold()),
     }, []
 
 
 def available_video_bundle_targets(
     target_dir: Path,
     video: Path,
-    subtitles: list[Path],
-    subtitle_tails: dict[Path, str],
+    companions: list[Path],
+    companion_tails: dict[Path, str],
     reserved: set[Path],
 ):
-    """Choose one suffix index that keeps a video and all its subtitles together."""
+    """Choose one suffix index that keeps a video and all companions together."""
     index = 0
 
     while True:
@@ -1129,22 +1177,41 @@ def available_video_bundle_targets(
             video_stem = f"{video.stem} ({index})"
 
         video_target = target_dir / video_name
-        subtitle_targets: dict[Path, Path] = {}
+        companion_targets: dict[Path, Path] = {}
         candidates = [video_target]
 
-        for subtitle in subtitles:
-            subtitle_target = target_dir / f"{video_stem}{subtitle_tails[subtitle]}"
-            subtitle_targets[subtitle] = subtitle_target
-            candidates.append(subtitle_target)
+        for companion in companions:
+            companion_target = target_dir / f"{video_stem}{companion_tails[companion]}"
+            companion_targets[companion] = companion_target
+            candidates.append(companion_target)
 
         candidate_names = [path.name.casefold() for path in candidates]
         if len(candidate_names) != len(set(candidate_names)):
             raise ValueError("video bundle would create duplicate target filenames")
 
         if all(not path.exists() and path not in reserved for path in candidates):
-            return video_target, subtitle_targets
+            return video_target, companion_targets
 
         index += 1
+
+
+def available_directory_target(target: Path, reserved: set[Path]) -> Path:
+    """Return a non-existing directory target without overwriting anything."""
+    if not target.exists() and target not in reserved:
+        return target
+
+    index = 1
+    while True:
+        candidate = target.with_name(f"{target.name} ({index})")
+        if not candidate.exists() and candidate not in reserved:
+            return candidate
+        index += 1
+
+
+def quarantine_root_for_target(target: Path) -> Path:
+    """Keep quarantined source shells outside the Plex library root."""
+    library_root = target.parent
+    return library_root.parent / "_PlexLibraryMaintainer_Quarantine" / library_root.name
 
 
 def plan_canonical_subtitle_flatten(
@@ -1197,7 +1264,7 @@ def plan_canonical_subtitle_flatten(
 
 
 def plan_collision_merges(plans: list[FolderPlan]):
-    """Build exact M3b move plans without mutating the filesystem."""
+    """Build exact M3b move and quarantine plans without mutating the filesystem."""
     destination_plans: dict[Path, list[FolderPlan]] = defaultdict(list)
     for plan in plans:
         destination_plans[plan.target].append(plan)
@@ -1205,6 +1272,7 @@ def plan_collision_merges(plans: list[FolderPlan]):
     reports: list[str] = []
     planned_moves = 0
     blocked_sources = 0
+    quarantine_reserved: set[Path] = set()
 
     for target in sorted(destination_plans, key=str):
         group = destination_plans[target]
@@ -1291,36 +1359,51 @@ def plan_collision_merges(plans: list[FolderPlan]):
             videos: list[Path] = classified["videos"]
             subtitle_to_video: dict[Path, Path] = classified["subtitle_to_video"]
             subtitle_tails: dict[Path, str] = classified["subtitle_tails"]
+            sidecar_to_video: dict[Path, Path] = classified["sidecar_to_video"]
+            sidecar_tails: dict[Path, str] = classified["sidecar_tails"]
             subtitle_dirs: dict[Path, list[Path]] = classified["subtitle_dirs"]
-            subtitles_by_video: dict[Path, list[Path]] = defaultdict(list)
-            for subtitle, video in subtitle_to_video.items():
-                subtitles_by_video[video].append(subtitle)
+            leftovers: list[Path] = classified["leftovers"]
 
-            source_moves: list[tuple[Path, Path]] = []
+            companions_by_video: dict[Path, list[Path]] = defaultdict(list)
+            companion_tails: dict[Path, str] = {}
+
+            for subtitle, video in subtitle_to_video.items():
+                companions_by_video[video].append(subtitle)
+                companion_tails[subtitle] = subtitle_tails[subtitle]
+
+            for sidecar, video in sidecar_to_video.items():
+                companions_by_video[video].append(sidecar)
+                companion_tails[sidecar] = sidecar_tails[sidecar]
+
+            source_moves: list[tuple[Path, Path, str]] = []
             target_by_subtitle: dict[Path, Path] = {}
 
             try:
                 for video in sorted(videos, key=lambda item: item.name.casefold()):
-                    associated_subtitles = sorted(
-                        subtitles_by_video.get(video, []),
+                    companions_for_video = sorted(
+                        companions_by_video.get(video, []),
                         key=lambda item: str(item).casefold(),
                     )
-                    video_target, subtitle_targets = available_video_bundle_targets(
+                    video_target, companion_targets = available_video_bundle_targets(
                         target,
                         video,
-                        associated_subtitles,
-                        subtitle_tails,
+                        companions_for_video,
+                        companion_tails,
                         reserved,
                     )
 
-                    source_moves.append((video, video_target))
+                    source_moves.append((video, video_target, "VIDEO"))
                     reserved.add(video_target)
 
-                    for subtitle in associated_subtitles:
-                        subtitle_target = subtitle_targets[subtitle]
-                        source_moves.append((subtitle, subtitle_target))
-                        target_by_subtitle[subtitle] = subtitle_target
-                        reserved.add(subtitle_target)
+                    for companion in companions_for_video:
+                        companion_target = companion_targets[companion]
+                        if companion in subtitle_to_video:
+                            kind = "SUBTITLE"
+                            target_by_subtitle[companion] = companion_target
+                        else:
+                            kind = "SIDECAR"
+                        source_moves.append((companion, companion_target, kind))
+                        reserved.add(companion_target)
             except ValueError as exc:
                 blocked_sources += 1
                 lines.append(f"  [M3 BLOCKED SOURCE] {source}")
@@ -1328,8 +1411,7 @@ def plan_collision_merges(plans: list[FolderPlan]):
                 continue
 
             lines.append(f"  [M3 SOURCE READY] {source}")
-            for source_path, target_path in source_moves:
-                kind = "SUBTITLE" if source_path in subtitle_to_video else "VIDEO"
+            for source_path, target_path, kind in source_moves:
                 lines.append(f"    [M3 MOVE {kind}] {source_path}")
                 lines.append(f"                     -> {target_path}")
                 planned_moves += 1
@@ -1348,8 +1430,29 @@ def plan_collision_merges(plans: list[FolderPlan]):
                     "(only after every planned subtitle is verified at destination)"
                 )
 
+            for leftover in leftovers:
+                lines.append(
+                    f"    [M3 LEFTOVER] {leftover} "
+                    "-> retained inside the source shell"
+                )
+
+            quarantine_root = quarantine_root_for_target(target)
+            quarantine_target = available_directory_target(
+                quarantine_root / source.name,
+                quarantine_reserved,
+            )
+            quarantine_reserved.add(quarantine_target)
+
             lines.append(
-                "    source folder is intentionally left in place; no source-folder deletion is planned"
+                f"    [M3 QUARANTINE MKDIR] {quarantine_root} "
+                "(if it does not already exist)"
+            )
+            lines.append(f"    [M3 QUARANTINE SOURCE] {source}")
+            lines.append(f"                           -> {quarantine_target}")
+            lines.append(
+                "      only after every planned move succeeds and every Subs/Subtitles "
+                "directory has been verified and removed; the source shell is moved intact, "
+                "never deleted"
             )
 
         reports.append("\n".join(lines))
