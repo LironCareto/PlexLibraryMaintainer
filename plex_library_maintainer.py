@@ -1482,6 +1482,170 @@ def selected_collision(plans: list[FolderPlan], selector: str):
     return matches[0]
 
 
+def build_collision_execution_plan(plans: list[FolderPlan], selector: str):
+    """Build a complete, read-only preflight plan for one selected collision."""
+    target, group = selected_collision(plans, selector)
+    sources = sorted({plan.source for plan in group}, key=str)
+
+    if target.exists():
+        if target.is_symlink() or not target.is_dir():
+            raise ValueError(f"canonical target is not a safe directory: {target}")
+        if target not in sources:
+            raise ValueError(
+                "canonical target exists but is not one of the Plex source folders"
+            )
+        create_target = False
+    else:
+        if (
+            not target.parent.exists()
+            or not target.parent.is_dir()
+            or target.parent.is_symlink()
+        ):
+            raise ValueError(
+                f"canonical target parent is not a safe directory: {target.parent}"
+            )
+        create_target = True
+
+    reserved: set[Path] = set()
+    quarantine_reserved: set[Path] = set()
+    actions = []
+
+    for source in sources:
+        classified, blockers = merge_source_files(source)
+        if blockers:
+            raise ValueError(f"{source}: " + "; ".join(blockers))
+
+        if source == target:
+            flatten_moves, removals, flatten_blockers = plan_canonical_subtitle_flatten(
+                target,
+                classified,
+                reserved,
+            )
+            if flatten_blockers:
+                raise ValueError(f"{source}: " + "; ".join(flatten_blockers))
+
+            actions.append(
+                {
+                    "source": source,
+                    "canonical": True,
+                    "moves": [
+                        (source_path, target_path, "SUBTITLE")
+                        for source_path, target_path in flatten_moves
+                    ],
+                    "subtitle_dirs": [path for path, _ in removals],
+                    "leftovers": classified["leftovers"],
+                    "quarantine_target": None,
+                }
+            )
+            continue
+
+        subtitle_to_video: dict[Path, Path] = classified["subtitle_to_video"]
+        subtitle_tails: dict[Path, str] = classified["subtitle_tails"]
+        sidecar_to_video: dict[Path, Path] = classified["sidecar_to_video"]
+        sidecar_tails: dict[Path, str] = classified["sidecar_tails"]
+        subtitle_dirs: dict[Path, list[Path]] = classified["subtitle_dirs"]
+
+        companions_by_video: dict[Path, list[Path]] = defaultdict(list)
+        companion_tails: dict[Path, str] = {}
+
+        for subtitle, video in subtitle_to_video.items():
+            companions_by_video[video].append(subtitle)
+            companion_tails[subtitle] = subtitle_tails[subtitle]
+
+        for sidecar, video in sidecar_to_video.items():
+            companions_by_video[video].append(sidecar)
+            companion_tails[sidecar] = sidecar_tails[sidecar]
+
+        moves: list[tuple[Path, Path, str]] = []
+
+        for video in sorted(classified["videos"], key=lambda item: item.name.casefold()):
+            companions = sorted(
+                companions_by_video.get(video, []),
+                key=lambda item: str(item).casefold(),
+            )
+            video_target, companion_targets = available_video_bundle_targets(
+                target,
+                video,
+                companions,
+                companion_tails,
+                reserved,
+            )
+
+            moves.append((video, video_target, "VIDEO"))
+            reserved.add(video_target)
+
+            for companion in companions:
+                companion_target = companion_targets[companion]
+                kind = "SUBTITLE" if companion in subtitle_to_video else "SIDECAR"
+                moves.append((companion, companion_target, kind))
+                reserved.add(companion_target)
+
+        quarantine_root = quarantine_root_for_target(target)
+        quarantine_target = available_directory_target(
+            quarantine_root / source.name,
+            quarantine_reserved,
+        )
+        quarantine_reserved.add(quarantine_target)
+
+        actions.append(
+            {
+                "source": source,
+                "canonical": False,
+                "moves": moves,
+                "subtitle_dirs": sorted(subtitle_dirs, key=str),
+                "leftovers": classified["leftovers"],
+                "quarantine_target": quarantine_target,
+            }
+        )
+
+    return {
+        "target": target,
+        "create_target": create_target,
+        "quarantine_root": quarantine_root_for_target(target),
+        "actions": actions,
+    }
+
+
+def print_collision_execution_plan(execution) -> None:
+    """Print the frozen shape M3c would execute; this function never writes."""
+    target: Path = execution["target"]
+
+    print("PlexLibraryMaintainer M3c preflight")
+    print("===================================")
+    print(f"Selected collision : {target}")
+    print("Scope              : this collision only")
+    print("Execution          : DISABLED")
+    print()
+
+    if execution["create_target"]:
+        print(f"[M3 MKDIR] {target}")
+
+    for action in execution["actions"]:
+        source = action["source"]
+        role = "CANONICAL SOURCE" if action["canonical"] else "SOURCE"
+        print(f"[M3 {role}] {source}")
+
+        for source_path, target_path, kind in action["moves"]:
+            print(f"  [M3 MOVE {kind}] {source_path}")
+            print(f"                   -> {target_path}")
+
+        for subtitle_dir in action["subtitle_dirs"]:
+            print(
+                f"  [M3 VERIFY SUBS] {subtitle_dir} "
+                "before removing it from the active library tree"
+            )
+
+        for leftover in action["leftovers"]:
+            print(f"  [M3 LEFTOVER] {leftover}")
+
+        quarantine_target = action["quarantine_target"]
+        if quarantine_target is not None:
+            print(f"  [M3 QUARANTINE SOURCE] {source}")
+            print(f"                         -> {quarantine_target}")
+
+        print()
+
+
 def validate_plans(
     plans: list[FolderPlan],
 ) -> tuple[list[FolderPlan], list[str], list[str], int]:
@@ -1723,8 +1887,15 @@ def main() -> int:
         conn.close()
 
     if args.merge_collision:
+        try:
+            execution = build_collision_execution_plan(plans, args.merge_collision)
+        except (OSError, ValueError) as exc:
+            print(f"[FATAL] M3c preflight refused the operation: {exc}", file=sys.stderr)
+            return 2
+
+        print_collision_execution_plan(execution)
         print(
-            "[FATAL] M3c execution is not wired yet; refusing all writes in --merge-collision mode.",
+            "[FATAL] M3c execution is not wired yet; preflight completed without changes.",
             file=sys.stderr,
         )
         return 2
