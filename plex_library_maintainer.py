@@ -24,6 +24,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+from ffmpeg_probe import probe_media_file_ffmpeg
+
 LIBRARY_DB = "com.plexapp.plugins.library.db"
 DEFAULT_CONFIG = Path("config.json")
 SUSPICIOUS_SIMILARITY_THRESHOLD = 0.55
@@ -2350,8 +2352,14 @@ def probe_media_file(ffprobe: str, path: Path):
     }
 
 
-def summarize_media_version(ffprobe: str, version):
-    probes = [probe_media_file(ffprobe, path) for path in version["files"]]
+def summarize_media_version(probe_binary: str, version, probe_backend: str):
+    if probe_backend == "ffprobe":
+        probes = [probe_media_file(probe_binary, path) for path in version["files"]]
+    else:
+        probes = [
+            probe_media_file_ffmpeg(probe_binary, path)
+            for path in version["files"]
+        ]
     errors = [probe["error"] for probe in probes if probe.get("error")]
     valid = [probe for probe in probes if not probe.get("error")]
 
@@ -2616,13 +2624,32 @@ def print_duplicate_report(
         for version in group["versions"].values()
     )
 
+    probe_backend = None
+    probe_binary = None
+    if probe_media:
+        probe_binary = find_ffprobe()
+        if probe_binary is not None:
+            probe_backend = "ffprobe"
+        else:
+            probe_binary = shutil.which("ffmpeg")
+            if probe_binary is not None:
+                probe_backend = "ffmpeg"
+
+        if probe_binary is None:
+            print(
+                "[FATAL] --probe-media requested but neither ffprobe nor ffmpeg "
+                "could be found.",
+                file=sys.stderr,
+            )
+            return 2
+
     print("PlexLibraryMaintainer M4 duplicate report")
     print("=========================================")
     print("Mode                : READ ONLY")
     print(f"Duplicate movies    : {len(groups)}")
     print(f"Media versions      : {version_count}")
     print(f"Media files         : {file_count}")
-    print(f"Technical probe     : {'ffprobe' if probe_media else 'disabled'}")
+    print(f"Technical probe     : {probe_backend if probe_media else 'disabled'}")
     if probe_media:
         print(
             f"Duration tolerance  : {DUPLICATE_DURATION_TOLERANCE_SECONDS:.0f}s "
@@ -2633,16 +2660,6 @@ def print_duplicate_report(
     if not groups:
         print("No Plex movie items with multiple media versions were found.")
         return 0
-
-    ffprobe = None
-    if probe_media:
-        ffprobe = find_ffprobe()
-        if ffprobe is None:
-            print(
-                "[FATAL] --probe-media requested but ffprobe could not be found.",
-                file=sys.stderr,
-            )
-            return 2
 
     probe_errors = 0
 
@@ -2671,7 +2688,10 @@ def print_duplicate_report(
             print()
             continue
 
-        summaries = [summarize_media_version(ffprobe, version) for version in versions]
+        summaries = [
+            summarize_media_version(probe_binary, version, probe_backend)
+            for version in versions
+        ]
         clusters = duration_clusters(summaries)
         labels = {}
         cluster_by_media_id = {}
@@ -2911,7 +2931,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "With --report duplicates, inspect each duplicate version with ffprobe "
-            "and classify duration clusters and conservative technical dominance."
+            "or fall back to ffmpeg, then classify duration clusters and conservative "
+            "technical dominance."
         ),
     )
     parser.add_argument(
