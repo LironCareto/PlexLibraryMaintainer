@@ -2681,8 +2681,9 @@ def print_duplicate_report(
     probe_error_details: list[str] = []
     tsv_rows: list[dict[str, object]] = []
     detailed_console = tsv_path is None
+    processed_versions = 0
 
-    for group in groups:
+    for group_index, group in enumerate(groups, start=1):
         title = display_title_year(group["title"], group["year"])
         versions = [
             group["versions"][media_id]
@@ -2745,6 +2746,14 @@ def print_duplicate_report(
                         print(f"       size: {human_size(size)}")
             if detailed_console:
                 print()
+            processed_versions += len(versions)
+            if tsv_path is not None:
+                print(
+                    f"Progress            : {group_index}/{len(groups)} movies | "
+                    f"{processed_versions}/{version_count} versions",
+                    end="\r",
+                    flush=True,
+                )
             continue
 
         summaries = [
@@ -2846,6 +2855,15 @@ def print_duplicate_report(
                 if detailed_console:
                     print(f"       [PROBE ERROR] {error}")
 
+        processed_versions += len(versions)
+        if tsv_path is not None:
+            print(
+                f"Progress            : {group_index}/{len(groups)} movies | "
+                f"{processed_versions}/{version_count} versions",
+                end="\r",
+                flush=True,
+            )
+
         if detailed_console:
             print("  Group assessment:")
             for cluster_index, cluster in enumerate(clusters, start=1):
@@ -2868,6 +2886,7 @@ def print_duplicate_report(
             print()
 
     if tsv_path is not None:
+        print()
         fieldnames = [
             "library", "title", "year", "metadata_id", "version_count",
             "media_id", "assessment", "cut_cluster", "cut_class", "files",
