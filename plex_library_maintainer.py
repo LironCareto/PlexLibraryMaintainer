@@ -1610,9 +1610,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--merge-collision",
+        metavar="CANONICAL_FOLDER",
+        help=(
+            "M3c: execute exactly one collision group selected by canonical folder "
+            "name or full path. Requires --write; M1/M2 writes are disabled."
+        ),
+    )
+    parser.add_argument(
         "--write",
         action="store_true",
-        help="Actually apply folder renames and root-file moves. Without this flag nothing is changed.",
+        help="Actually apply the selected write operation. Without this flag nothing is changed.",
     )
     return parser
 
@@ -1625,6 +1633,17 @@ def main() -> int:
             "[FATAL] M3 diagnostic modes cannot be combined with --write.",
             file=sys.stderr,
         )
+        return 2
+
+    if args.merge_collision and (args.analyze_collisions or args.plan_collisions):
+        print(
+            "[FATAL] --merge-collision cannot be combined with M3 diagnostic modes.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.merge_collision and not args.write:
+        print("[FATAL] --merge-collision requires --write.", file=sys.stderr)
         return 2
 
     try:
