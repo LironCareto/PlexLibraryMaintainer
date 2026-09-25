@@ -2774,6 +2774,9 @@ def print_duplicate_report(
     print("====================")
     print(f"Duplicate movies    : {len(groups)}")
     print(f"Media versions      : {version_count}")
+    print(f"Technical probe     : {probe_backend if probe_media else 'disabled'}")
+    if probe_media:
+        print(f"Probe binary        : {probe_binary}")
     print(f"Probe errors        : {probe_errors}")
     return 1 if probe_errors else 0
 
