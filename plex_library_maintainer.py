@@ -2305,6 +2305,16 @@ def probe_media_file(ffprobe: str, path: Path):
         else:
             hdr = "SDR/unknown"
 
+        raw_video_bitrate = stream.get("bit_rate")
+        try:
+            video_bitrate = (
+                int(raw_video_bitrate)
+                if raw_video_bitrate not in (None, "", "N/A")
+                else None
+            )
+        except (TypeError, ValueError):
+            video_bitrate = None
+
         video = {
             "codec": str(stream.get("codec_name") or "?"),
             "profile": str(stream.get("profile") or ""),
@@ -2313,11 +2323,21 @@ def probe_media_file(ffprobe: str, path: Path):
             "pix_fmt": pix_fmt,
             "bit_depth": bit_depth,
             "hdr": hdr,
+            "bitrate": video_bitrate,
         }
 
     audio = []
     for stream in audio_streams:
         tags = stream.get("tags") or {}
+        raw_audio_bitrate = stream.get("bit_rate")
+        try:
+            audio_bitrate = (
+                int(raw_audio_bitrate)
+                if raw_audio_bitrate not in (None, "", "N/A")
+                else None
+            )
+        except (TypeError, ValueError):
+            audio_bitrate = None
         audio.append(
             {
                 "language": str(tags.get("language") or "und").casefold(),
@@ -2325,6 +2345,7 @@ def probe_media_file(ffprobe: str, path: Path):
                 "channels": int(stream.get("channels") or 0),
                 "layout": str(stream.get("channel_layout") or ""),
                 "title": str(tags.get("title") or ""),
+                "bitrate": audio_bitrate,
             }
         )
 
@@ -2391,6 +2412,14 @@ def summarize_media_version(probe_binary: str, version, probe_backend: str):
         for probe in valid
         for stream in probe.get("audio", [])
     }
+    audio_coverage_signatures = {
+        (
+            stream["language"],
+            stream["channels"],
+        )
+        for probe in valid
+        for stream in probe.get("audio", [])
+    }
     subtitle_signatures = {
         (
             stream["language"],
@@ -2414,6 +2443,7 @@ def summarize_media_version(probe_binary: str, version, probe_backend: str):
         "video": video,
         "mixed_video": mixed_video,
         "audio_signatures": audio_signatures,
+        "audio_coverage_signatures": audio_coverage_signatures,
         "subtitle_signatures": subtitle_signatures,
     }
 
@@ -2484,7 +2514,9 @@ def version_dominates(better, worse) -> bool:
     ):
         return False
 
-    if not better["audio_signatures"].issuperset(worse["audio_signatures"]):
+    if not better["audio_coverage_signatures"].issuperset(
+        worse["audio_coverage_signatures"]
+    ):
         return False
     if not better["subtitle_signatures"].issuperset(worse["subtitle_signatures"]):
         return False
@@ -2501,7 +2533,7 @@ def version_dominates(better, worse) -> bool:
             and worse_depth is not None
             and better_depth > worse_depth
         )
-        or better["audio_signatures"] > worse["audio_signatures"]
+        or better["audio_coverage_signatures"] > worse["audio_coverage_signatures"]
         or better["subtitle_signatures"] > worse["subtitle_signatures"]
     )
     return strict
@@ -2566,13 +2598,29 @@ def describe_video(version) -> str:
 
 
 def describe_audio(version) -> str:
-    if not version["audio_signatures"]:
+    audio_streams = [
+        stream
+        for probe in version["probes"]
+        if not probe.get("error")
+        for stream in probe.get("audio", [])
+    ]
+    if not audio_streams:
         return "none"
+
     items = []
-    for language, codec, channels in sorted(version["audio_signatures"]):
+    for stream in audio_streams:
+        language = stream["language"]
+        codec = stream["codec"]
+        channels = stream["channels"]
         channel_text = f"{channels}ch" if channels else "?ch"
-        items.append(f"{language}:{codec}/{channel_text}")
-    return ", ".join(items)
+        bitrate = stream.get("bitrate")
+        bitrate_text = (
+            f"@{bitrate / 1000:.0f}kbps"
+            if bitrate is not None
+            else ""
+        )
+        items.append(f"{language}:{codec}/{channel_text}{bitrate_text}")
+    return ", ".join(sorted(items))
 
 
 def describe_subtitles(version) -> str:
@@ -2810,6 +2858,11 @@ def print_duplicate_report(
                     "bitrate_mbps": (
                         f"{bitrate_mbps:.3f}" if bitrate_mbps != "" else ""
                     ),
+                    "video_bitrate_mbps": (
+                        f"{video.get('bitrate') / 1_000_000:.3f}"
+                        if video.get("bitrate") is not None
+                        else ""
+                    ),
                     "resolution": resolution,
                     "video_codec": video.get("codec") or "",
                     "video_profile": video.get("profile") or "",
@@ -2891,7 +2944,7 @@ def print_duplicate_report(
             "library", "title", "year", "metadata_id", "version_count",
             "media_id", "assessment", "cut_cluster", "cut_class", "files",
             "file_count", "size_bytes", "size", "duration_seconds", "duration",
-            "bitrate_mbps", "resolution", "video_codec", "video_profile",
+            "bitrate_mbps", "video_bitrate_mbps", "resolution", "video_codec", "video_profile",
             "bit_depth", "hdr", "audio", "subtitles", "multipart",
             "mixed_video", "probe_errors",
         ]
