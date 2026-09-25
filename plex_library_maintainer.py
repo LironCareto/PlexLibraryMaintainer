@@ -1548,9 +1548,19 @@ def build_collision_execution_plan(plans: list[FolderPlan], selector: str):
 
             subtitle_quarantine_targets = []
             quarantine_root = quarantine_root_for_target(target)
+            canonical_quarantine_dir = quarantine_root / target.name
+            if canonical_quarantine_dir.exists() and (
+                canonical_quarantine_dir.is_symlink()
+                or not canonical_quarantine_dir.is_dir()
+            ):
+                raise ValueError(
+                    "canonical quarantine path is not a safe directory: "
+                    f"{canonical_quarantine_dir}"
+                )
+
             for subtitle_dir, _ in removals:
                 quarantine_target = available_directory_target(
-                    quarantine_root / f"{target.name}__{subtitle_dir.name}",
+                    canonical_quarantine_dir / subtitle_dir.name,
                     quarantine_reserved,
                 )
                 quarantine_reserved.add(quarantine_target)
@@ -1858,7 +1868,19 @@ def execute_collision_execution_plan(execution) -> int:
 
             for subtitle_dir, subtitle_quarantine in action["subtitle_quarantine_targets"]:
                 try:
-                    subtitle_quarantine.parent.mkdir(parents=True, exist_ok=True)
+                    quarantine_parent = subtitle_quarantine.parent
+                    if quarantine_parent.exists() and (
+                        quarantine_parent.is_symlink()
+                        or not quarantine_parent.is_dir()
+                    ):
+                        raise OSError(
+                            f"unsafe subtitle quarantine parent: {quarantine_parent}"
+                        )
+                    quarantine_parent.mkdir(parents=True, exist_ok=True)
+                    if quarantine_parent.is_symlink() or not quarantine_parent.is_dir():
+                        raise OSError(
+                            f"unsafe subtitle quarantine parent: {quarantine_parent}"
+                        )
                     if subtitle_quarantine.exists():
                         raise OSError(
                             f"refusing to overwrite subtitle quarantine target: "
