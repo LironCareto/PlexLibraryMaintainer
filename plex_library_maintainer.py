@@ -1468,18 +1468,28 @@ def plan_collision_merges(plans: list[FolderPlan]):
     return reports, planned_moves, blocked_sources
 
 
-def selected_collision(plans: list[FolderPlan], selector: str):
-    """Return exactly one collision group selected by canonical name or path."""
+def collision_groups(plans: list[FolderPlan]) -> dict[Path, list[FolderPlan]]:
+    """Return only Plex targets currently backed by more than one source folder."""
     groups: dict[Path, list[FolderPlan]] = defaultdict(list)
     for plan in plans:
         groups[plan.target].append(plan)
+
+    return {
+        target: group
+        for target, group in groups.items()
+        if len({plan.source for plan in group}) > 1
+    }
+
+
+def selected_collision(plans: list[FolderPlan], selector: str):
+    """Return exactly one collision group selected by canonical name or path."""
+    groups = collision_groups(plans)
 
     key = selector.casefold()
     matches = [
         (target, group)
         for target, group in groups.items()
-        if len({plan.source for plan in group}) > 1
-        and (target.name.casefold() == key or str(target).casefold() == key)
+        if target.name.casefold() == key or str(target).casefold() == key
     ]
 
     if not matches:
@@ -1651,6 +1661,63 @@ def build_collision_execution_plan(plans: list[FolderPlan], selector: str):
         "metadata_plan": group[0],
         "actions": actions,
     }
+
+
+def build_ready_collision_executions(plans: list[FolderPlan]):
+    """Preflight every collision, returning executable groups and refused groups."""
+    ready = []
+    skipped = []
+
+    for target in sorted(collision_groups(plans), key=str):
+        try:
+            ready.append(build_collision_execution_plan(plans, str(target)))
+        except (OSError, ValueError) as exc:
+            skipped.append((target, str(exc)))
+
+    return ready, skipped
+
+
+def print_batch_collision_preflight(ready, skipped, will_write: bool) -> None:
+    print("PlexLibraryMaintainer M3 batch preflight")
+    print("=======================================")
+    print(f"Collision groups     : {len(ready) + len(skipped)}")
+    print(f"Ready                : {len(ready)}")
+    print(f"Skipped              : {len(skipped)}")
+    print(f"Execution            : {'WRITE ready groups' if will_write else 'DRY RUN'}")
+    print()
+
+    for execution in ready:
+        print(f"[M3 READY] {execution['target']}")
+
+    for target, reason in skipped:
+        print(f"[M3 SKIP] {target}")
+        print(f"          reason: {reason}")
+
+
+def execute_ready_collision_batch(ready) -> int:
+    """Execute preflighted collision groups sequentially; stop on first runtime error."""
+    completed = 0
+
+    for index, execution in enumerate(ready, start=1):
+        print()
+        print(f"M3 batch group {index}/{len(ready)}")
+        print("==============================")
+        print_collision_execution_plan(execution)
+        result = execute_collision_execution_plan(execution)
+        if result != 0:
+            print(
+                f"[FATAL] M3 batch stopped after {completed} completed group(s).",
+                file=sys.stderr,
+            )
+            return result
+        completed += 1
+
+    print()
+    print("M3 batch summary")
+    print("================")
+    print(f"Groups completed     : {completed}")
+    print("Runtime errors       : 0")
+    return 0
 
 
 def print_collision_execution_plan(execution) -> None:
@@ -2114,6 +2181,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--merge-ready-collisions",
+        action="store_true",
+        help=(
+            "M3 batch mode: preflight every collision and select only groups that pass "
+            "all M3 write guardrails. Dry-run by default; add --write to execute them. "
+            "Rejected groups are skipped and M1/M2 writes are disabled."
+        ),
+    )
+    parser.add_argument(
         "--write",
         action="store_true",
         help="Actually apply the selected write operation. Without this flag nothing is changed.",
@@ -2131,9 +2207,18 @@ def main() -> int:
         )
         return 2
 
-    if args.merge_collision and (args.analyze_collisions or args.plan_collisions):
+    if args.merge_collision and args.merge_ready_collisions:
         print(
-            "[FATAL] --merge-collision cannot be combined with M3 diagnostic modes.",
+            "[FATAL] --merge-collision and --merge-ready-collisions are mutually exclusive.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if (args.merge_collision or args.merge_ready_collisions) and (
+        args.analyze_collisions or args.plan_collisions
+    ):
+        print(
+            "[FATAL] M3 merge modes cannot be combined with M3 diagnostic modes.",
             file=sys.stderr,
         )
         return 2
@@ -2227,6 +2312,21 @@ def main() -> int:
 
         print_collision_execution_plan(execution)
         return execute_collision_execution_plan(execution)
+
+    if args.merge_ready_collisions:
+        ready, skipped = build_ready_collision_executions(plans)
+        print_batch_collision_preflight(ready, skipped, args.write)
+        if not args.write:
+            print()
+            print("DRY RUN ONLY. Nothing was changed. Add --write to execute ready M3 groups.")
+            return 0
+
+        if not ready:
+            print()
+            print("No collision groups passed the M3 write preflight. Nothing was changed.")
+            return 0
+
+        return execute_ready_collision_batch(ready)
 
     actionable, validation_review, collision_reports, already_normalized = validate_plans(plans)
     m3_analysis_reports = analyze_collision_plans(plans) if args.analyze_collisions else []
