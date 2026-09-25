@@ -1722,6 +1722,13 @@ def main() -> int:
     finally:
         conn.close()
 
+    if args.merge_collision:
+        print(
+            "[FATAL] M3c execution is not wired yet; refusing all writes in --merge-collision mode.",
+            file=sys.stderr,
+        )
+        return 2
+
     actionable, validation_review, collision_reports, already_normalized = validate_plans(plans)
     m3_analysis_reports = analyze_collision_plans(plans) if args.analyze_collisions else []
     if args.plan_collisions:
