@@ -6,18 +6,18 @@ from pathlib import Path
 
 
 def _language(line: str) -> str:
-    match = re.search(r"Stream #\\S+\\(([^)]+)\\):", line)
+    match = re.search(r"Stream #\S+\(([^)]+)\):", line)
     return match.group(1).casefold() if match else "und"
 
 
 def _channels(line: str) -> int:
     lowered = line.casefold()
-    if re.search(r"\\bmono\\b", lowered):
+    if re.search(r"\bmono\b", lowered):
         return 1
-    if re.search(r"\\bstereo\\b", lowered):
+    if re.search(r"\bstereo\b", lowered):
         return 2
 
-    match = re.search(r"\\b(\\d+)\\.(\\d+)(?:\\([^)]*\\))?\\b", lowered)
+    match = re.search(r"\b(\d+)\.(\d+)(?:\([^)]*\))?\b", lowered)
     if match:
         return int(match.group(1)) + int(match.group(2))
     return 0
@@ -45,7 +45,7 @@ def probe_media_file_ffmpeg(ffmpeg: str, path: Path):
 
     output = completed.stderr or ""
     duration = None
-    match = re.search(r"Duration:\\s*(\\d+):(\\d+):(\\d+(?:\\.\\d+)?)", output)
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", output)
     if match:
         duration = (
             int(match.group(1)) * 3600
@@ -63,10 +63,10 @@ def probe_media_file_ffmpeg(ffmpeg: str, path: Path):
             continue
 
         if " Video: " in line and video is None:
-            codec = re.search(r"Video:\\s*([^,\\s]+)", line)
-            profile = re.search(r"Video:\\s*[^,(\\s]+\\s*\\(([^)]+)\\)", line)
-            pix_fmt = re.search(r"Video:\\s*[^,]+,\\s*([^,\\s(]+)", line)
-            resolution = re.search(r"\\b(\\d{2,5})x(\\d{2,5})\\b", line)
+            codec = re.search(r"Video:\s*([^,\s]+)", line)
+            profile = re.search(r"Video:\s*[^,(\s]+\s*\(([^)]+)\)", line)
+            pix_fmt = re.search(r"Video:\s*[^,]+,\s*([^,\s(]+)", line)
+            resolution = re.search(r"\b(\d{2,5})x(\d{2,5})\b", line)
 
             pixel_format = pix_fmt.group(1) if pix_fmt else ""
             bit_depth = None
@@ -99,9 +99,9 @@ def probe_media_file_ffmpeg(ffmpeg: str, path: Path):
             }
 
         elif " Audio: " in line:
-            codec = re.search(r"Audio:\\s*([^,\\s]+)", line)
+            codec = re.search(r"Audio:\s*([^,\s]+)", line)
             layout = re.search(
-                r"\\b(mono|stereo|\\d+\\.\\d+(?:\\([^)]*\\))?)\\b",
+                r"\b(mono|stereo|\d+\.\d+(?:\([^)]*\))?)\b",
                 line,
                 flags=re.IGNORECASE,
             )
@@ -116,7 +116,7 @@ def probe_media_file_ffmpeg(ffmpeg: str, path: Path):
             )
 
         elif " Subtitle: " in line:
-            codec = re.search(r"Subtitle:\\s*([^,\\s]+)", line)
+            codec = re.search(r"Subtitle:\s*([^,\s]+)", line)
             lowered = line.casefold()
             subtitles.append(
                 {
