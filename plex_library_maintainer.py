@@ -2591,6 +2591,18 @@ def describe_subtitles(version) -> str:
     return ", ".join(items)
 
 
+def configured_executable(value, key: str):
+    """Validate an optional private executable path from local config."""
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"'{key}' in config must be a string")
+    path = Path(value)
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise ValueError(f"Configured {key} is not an executable file: {path}")
+    return str(path)
+
+
 def find_ffprobe():
     """Locate ffprobe in PATH or common package locations."""
     found = shutil.which("ffprobe")
@@ -2615,6 +2627,8 @@ def print_duplicate_report(
     libraries: list[Library],
     path_maps: list[tuple[str, str]],
     probe_media: bool,
+    ffprobe_path: str | None = None,
+    ffmpeg_path: str | None = None,
 ) -> int:
     groups = duplicate_movie_groups(conn, libraries, path_maps)
     version_count = sum(len(group["versions"]) for group in groups)
@@ -2627,11 +2641,11 @@ def print_duplicate_report(
     probe_backend = None
     probe_binary = None
     if probe_media:
-        probe_binary = find_ffprobe()
+        probe_binary = ffprobe_path or find_ffprobe()
         if probe_binary is not None:
             probe_backend = "ffprobe"
         else:
-            probe_binary = shutil.which("ffmpeg")
+            probe_binary = ffmpeg_path or shutil.which("ffmpeg")
             if probe_binary is not None:
                 probe_backend = "ffmpeg"
 
@@ -3021,6 +3035,8 @@ def main() -> int:
             )
 
         path_maps = args.path_map if args.path_map else config_path_maps(config)
+        ffprobe_path = configured_executable(config.get("ffprobe_path"), "ffprobe_path")
+        ffmpeg_path = configured_executable(config.get("ffmpeg_path"), "ffmpeg_path")
 
         if args.library:
             requested_libraries = args.library
@@ -3075,6 +3091,8 @@ def main() -> int:
                 libraries,
                 path_maps,
                 probe_media=args.probe_media,
+                ffprobe_path=ffprobe_path,
+                ffmpeg_path=ffmpeg_path,
             )
 
         plans, root_file_plans, build_review, unsafe_names, build_skipped = build_plans(
