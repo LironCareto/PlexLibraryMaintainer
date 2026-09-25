@@ -32,6 +32,8 @@ VIDEO_EXTENSIONS = {
 SUBTITLE_EXTENSIONS = {".ass", ".idx", ".smi", ".srt", ".ssa", ".sub", ".sup", ".vtt"}
 GENERIC_SIDECAR_EXTENSIONS = {".jpg", ".jpeg", ".nfo", ".png", ".webp"}
 SUBTITLE_DIRECTORY_NAMES = {"subs", "subtitles"}
+SYSTEM_METADATA_DIRECTORY_NAMES = {"@eadir"}
+SYSTEM_METADATA_FILE_NAMES = {".ds_store", "thumbs.db"}
 
 
 @dataclass(frozen=True)
@@ -691,11 +693,21 @@ def collision_source_inventory(source: Path) -> list[str]:
         for name in list(dir_names):
             path = root / name
             relative = path.relative_to(source)
+
             if path.is_symlink():
                 entries.append(("symlink_dir", relative))
                 dir_names.remove(name)
-            else:
-                entries.append(("directory", relative))
+                continue
+
+            if name.casefold() in SYSTEM_METADATA_DIRECTORY_NAMES:
+                entries.append(("system_dir", relative))
+                # DSM's @eaDir tree contains generated indexes, thumbnails and
+                # streams. It is never movie content, so do not recurse into it
+                # or let it affect M3 safety classification.
+                dir_names.remove(name)
+                continue
+
+            entries.append(("directory", relative))
 
         for name in file_names:
             path = root / name
@@ -703,6 +715,10 @@ def collision_source_inventory(source: Path) -> list[str]:
 
             if path.is_symlink():
                 entries.append(("symlink_file", relative))
+                continue
+
+            if name.casefold() in SYSTEM_METADATA_FILE_NAMES:
+                entries.append(("system_file", relative))
                 continue
 
             suffix = path.suffix.casefold()
@@ -721,6 +737,11 @@ def collision_source_inventory(source: Path) -> list[str]:
     videos = [relative for kind, relative in entries if kind == "video"]
     subtitles = [relative for kind, relative in entries if kind == "subtitle"]
     sidecars = [relative for kind, relative in entries if kind == "sidecar"]
+    system_metadata = [
+        relative
+        for kind, relative in entries
+        if kind in {"system_dir", "system_file"}
+    ]
     ambiguous = [
         relative
         for kind, relative in entries
@@ -731,6 +752,7 @@ def collision_source_inventory(source: Path) -> list[str]:
         "      summary: "
         f"{len(videos)} video(s), {len(subtitles)} subtitle(s), "
         f"{len(sidecars)} known generic sidecar(s), "
+        f"{len(system_metadata)} system metadata item(s), "
         f"{len(ambiguous)} immediately ambiguous item(s)"
     )
 
@@ -764,6 +786,20 @@ def collision_source_inventory(source: Path) -> list[str]:
             lines.append(
                 f"      [GENERIC SIDECAR] {relative}"
                 " -> association is not assumed"
+            )
+            continue
+
+        if kind == "system_dir":
+            lines.append(
+                f"      [SYSTEM METADATA DIR] {relative}"
+                " -> ignored for merge safety and not scanned"
+            )
+            continue
+
+        if kind == "system_file":
+            lines.append(
+                f"      [SYSTEM METADATA FILE] {relative}"
+                " -> ignored for merge safety"
             )
             continue
 
