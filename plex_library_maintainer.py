@@ -902,10 +902,20 @@ def subtitle_matches_video(subtitle: Path, video: Path) -> bool:
     subtitle_folded = subtitle_base.casefold()
     video_folded = video_stem.casefold()
 
-    return (
-        subtitle_folded == video_folded
-        or subtitle_folded.startswith(video_folded + ".")
-    )
+    if subtitle_folded == video_folded:
+        return True
+
+    if not subtitle_folded.startswith(video_folded):
+        return False
+
+    tail = subtitle_base[len(video_stem):]
+    if not tail:
+        return True
+
+    # Accept only an explicit filename separator before a subtitle qualifier.
+    # This covers common ".eng", "-spa", "_eng", and " English" forms
+    # without fuzzy matching unrelated filenames.
+    return tail[0] in ".-_ "
 
 
 def subtitle_tail_for_video(subtitle: Path, video: Path) -> str:
@@ -919,9 +929,7 @@ def subtitle_tail_for_video(subtitle: Path, video: Path) -> str:
     subtitle_folded = subtitle_base.casefold()
     video_folded = video.stem.casefold()
 
-    if subtitle_folded == video_folded:
-        return subtitle.suffix
-    if subtitle_folded.startswith(video_folded + "."):
+    if subtitle_matches_video(subtitle, video):
         return subtitle_base[len(video.stem):] + subtitle.suffix
     return f".{subtitle_base}{subtitle.suffix}"
 
