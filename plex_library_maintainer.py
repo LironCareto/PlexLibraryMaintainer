@@ -25,6 +25,14 @@ LIBRARY_DB = "com.plexapp.plugins.library.db"
 DEFAULT_CONFIG = Path("config.json")
 SUSPICIOUS_SIMILARITY_THRESHOLD = 0.55
 
+VIDEO_EXTENSIONS = {
+    ".avi", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg",
+    ".mpg", ".ts", ".webm", ".wmv",
+}
+SUBTITLE_EXTENSIONS = {".ass", ".idx", ".smi", ".srt", ".ssa", ".sub", ".sup", ".vtt"}
+GENERIC_SIDECAR_EXTENSIONS = {".jpg", ".jpeg", ".nfo", ".png", ".webp"}
+SUBTITLE_DIRECTORY_NAMES = {"subs", "subtitles"}
+
 
 @dataclass(frozen=True)
 class Library:
@@ -655,6 +663,188 @@ def build_plans(
 
     return folder_plans, root_file_plans, review, unsafe_names, skipped
 
+def collision_source_inventory(source: Path) -> list[str]:
+    """Describe a collision source without proposing or performing mutations."""
+    lines: list[str] = []
+
+    if not source.exists():
+        return ["      [MISSING] source does not exist"]
+    if source.is_symlink():
+        return ["      [AMBIGUOUS SYMLINK] source folder itself is a symlink"]
+    if not source.is_dir():
+        return ["      [AMBIGUOUS] source is not a directory"]
+
+    entries: list[tuple[str, Path]] = []
+    walk_errors: list[str] = []
+
+    def on_walk_error(exc):
+        walk_errors.append(str(exc))
+
+    for root_text, dir_names, file_names in os.walk(
+        source,
+        topdown=True,
+        onerror=on_walk_error,
+        followlinks=False,
+    ):
+        root = Path(root_text)
+
+        for name in list(dir_names):
+            path = root / name
+            relative = path.relative_to(source)
+            if path.is_symlink():
+                entries.append(("symlink_dir", relative))
+                dir_names.remove(name)
+            else:
+                entries.append(("directory", relative))
+
+        for name in file_names:
+            path = root / name
+            relative = path.relative_to(source)
+
+            if path.is_symlink():
+                entries.append(("symlink_file", relative))
+                continue
+
+            suffix = path.suffix.casefold()
+            if suffix in VIDEO_EXTENSIONS:
+                kind = "video"
+            elif suffix in SUBTITLE_EXTENSIONS:
+                kind = "subtitle"
+            elif suffix in GENERIC_SIDECAR_EXTENSIONS:
+                kind = "sidecar"
+            else:
+                kind = "unknown_file"
+            entries.append((kind, relative))
+
+    entries.sort(key=lambda item: str(item[1]).casefold())
+
+    videos = [relative for kind, relative in entries if kind == "video"]
+    subtitles = [relative for kind, relative in entries if kind == "subtitle"]
+    sidecars = [relative for kind, relative in entries if kind == "sidecar"]
+    ambiguous = [
+        relative
+        for kind, relative in entries
+        if kind in {"unknown_file", "symlink_file", "symlink_dir"}
+    ]
+
+    lines.append(
+        "      summary: "
+        f"{len(videos)} video(s), {len(subtitles)} subtitle(s), "
+        f"{len(sidecars)} known generic sidecar(s), "
+        f"{len(ambiguous)} immediately ambiguous item(s)"
+    )
+
+    sole_video = videos[0] if len(videos) == 1 else None
+
+    for kind, relative in entries:
+        if kind == "video":
+            lines.append(f"      [VIDEO] {relative}")
+            continue
+
+        if kind == "subtitle":
+            in_subtitle_tree = (
+                bool(relative.parts)
+                and relative.parts[0].casefold() in SUBTITLE_DIRECTORY_NAMES
+            )
+            location_note = " in subtitle directory" if in_subtitle_tree else ""
+
+            if sole_video is not None:
+                lines.append(
+                    f"      [POTENTIAL SUBTITLE]{location_note} {relative}"
+                    f" -> sole video is {sole_video}"
+                )
+            else:
+                lines.append(
+                    f"      [AMBIGUOUS SUBTITLE]{location_note} {relative}"
+                    f" -> source contains {len(videos)} video files"
+                )
+            continue
+
+        if kind == "sidecar":
+            lines.append(
+                f"      [GENERIC SIDECAR] {relative}"
+                " -> association is not assumed"
+            )
+            continue
+
+        if kind == "directory":
+            if (
+                bool(relative.parts)
+                and relative.parts[0].casefold() in SUBTITLE_DIRECTORY_NAMES
+            ):
+                lines.append(f"      [SUBTITLE DIR] {relative}")
+            else:
+                lines.append(
+                    f"      [AMBIGUOUS DIR] {relative}"
+                    " -> contents must be reviewed before any merge"
+                )
+            continue
+
+        if kind == "symlink_dir":
+            lines.append(
+                f"      [AMBIGUOUS SYMLINK DIR] {relative}"
+                " -> never follow automatically"
+            )
+            continue
+
+        if kind == "symlink_file":
+            lines.append(
+                f"      [AMBIGUOUS SYMLINK FILE] {relative}"
+                " -> never move automatically"
+            )
+            continue
+
+        lines.append(
+            f"      [AMBIGUOUS FILE] {relative}"
+            " -> unrecognized file type"
+        )
+
+    for error in walk_errors:
+        lines.append(f"      [SCAN ERROR] {error}")
+
+    if not entries and not walk_errors:
+        lines.append("      [EMPTY] folder contains no entries")
+
+    return lines
+
+
+def analyze_collision_plans(plans: list[FolderPlan]) -> list[str]:
+    """Inventory multi-folder Plex collisions for M3a; never mutate anything."""
+    destination_sources: dict[Path, list[Path]] = defaultdict(list)
+    for plan in plans:
+        destination_sources[plan.target].append(plan.source)
+
+    reports: list[str] = []
+
+    for target in sorted(destination_sources, key=str):
+        sources = sorted(set(destination_sources[target]), key=str)
+        if len(sources) <= 1:
+            continue
+
+        lines = [
+            f"[M3 ANALYSIS] canonical target: {target}",
+            "  mode: diagnostic only; no merge, rename, move, or delete is planned",
+            f"  Plex source folders: {len(sources)}",
+            f"  canonical target currently exists: {'yes' if target.exists() else 'no'}",
+        ]
+
+        for source in sources:
+            role = "canonical source" if source == target else "source"
+            lines.append(f"  {role}: {source}")
+            lines.extend(collision_source_inventory(source))
+
+        if target.exists() and target not in sources:
+            lines.append(
+                "  existing target not represented as a Plex source in this collision:"
+                f" {target}"
+            )
+            lines.extend(collision_source_inventory(target))
+
+        reports.append("\n".join(lines))
+
+    return reports
+
+
 def validate_plans(
     plans: list[FolderPlan],
 ) -> tuple[list[FolderPlan], list[str], list[str], int]:
@@ -767,6 +957,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--analyze-collisions",
+        action="store_true",
+        help=(
+            "M3a diagnostic: inventory every multi-folder collision in detail. "
+            "This mode is read-only and cannot be combined with --write."
+        ),
+    )
+    parser.add_argument(
         "--write",
         action="store_true",
         help="Actually apply folder renames and root-file moves. Without this flag nothing is changed.",
@@ -776,6 +974,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+
+    if args.analyze_collisions and args.write:
+        print(
+            "[FATAL] --analyze-collisions is diagnostic-only and cannot be combined with --write.",
+            file=sys.stderr,
+        )
+        return 2
 
     try:
         config = load_config(args.config)
@@ -854,6 +1059,7 @@ def main() -> int:
         conn.close()
 
     actionable, validation_review, collision_reports, already_normalized = validate_plans(plans)
+    m3_analysis_reports = analyze_collision_plans(plans) if args.analyze_collisions else []
     actionable, suspicious = split_suspicious_plans(actionable, "M1")
     root_actionable, root_suspicious = split_suspicious_plans(root_file_plans, "M2")
     suspicious = suspicious + root_suspicious
@@ -891,6 +1097,10 @@ def main() -> int:
         print(line)
 
     for report in collision_reports:
+        print(report)
+
+    for report in m3_analysis_reports:
+        print()
         print(report)
 
     renamed = 0
@@ -985,6 +1195,7 @@ def main() -> int:
     print(f"Suspicious matches  : {len(suspicious)}")
     print(f"Needs review        : {len(review)}")
     print(f"Collision groups    : {len(collision_reports)}")
+    print(f"M3 analyses         : {len(m3_analysis_reports)}")
     print(f"Errors              : {errors}")
     if rename_log_path is not None:
         print(f"Rename audit log    : {rename_log_path}")
