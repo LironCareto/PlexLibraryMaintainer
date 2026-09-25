@@ -1460,6 +1460,28 @@ def plan_collision_merges(plans: list[FolderPlan]):
     return reports, planned_moves, blocked_sources
 
 
+def selected_collision(plans: list[FolderPlan], selector: str):
+    """Return exactly one collision group selected by canonical name or path."""
+    groups: dict[Path, list[FolderPlan]] = defaultdict(list)
+    for plan in plans:
+        groups[plan.target].append(plan)
+
+    key = selector.casefold()
+    matches = [
+        (target, group)
+        for target, group in groups.items()
+        if len({plan.source for plan in group}) > 1
+        and (target.name.casefold() == key or str(target).casefold() == key)
+    ]
+
+    if not matches:
+        raise ValueError(f"no collision found for {selector!r}")
+    if len(matches) != 1:
+        raise ValueError(f"collision selector is ambiguous: {selector!r}")
+
+    return matches[0]
+
+
 def validate_plans(
     plans: list[FolderPlan],
 ) -> tuple[list[FolderPlan], list[str], list[str], int]:
