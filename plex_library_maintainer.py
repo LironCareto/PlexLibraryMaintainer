@@ -881,6 +881,236 @@ def analyze_collision_plans(plans: list[FolderPlan]) -> list[str]:
     return reports
 
 
+def subtitle_matches_video(subtitle: Path, video: Path) -> bool:
+    """Return whether a subtitle filename is clearly associated with a video."""
+    subtitle_base = subtitle.name[:-len(subtitle.suffix)] if subtitle.suffix else subtitle.name
+    video_stem = video.stem
+
+    subtitle_folded = subtitle_base.casefold()
+    video_folded = video_stem.casefold()
+
+    return (
+        subtitle_folded == video_folded
+        or subtitle_folded.startswith(video_folded + ".")
+    )
+
+
+def merge_source_files(source: Path):
+    """Classify top-level source files for conservative M3b planning.
+
+    System metadata is ignored. Any real directory, symlink, generic sidecar,
+    or unknown file blocks automatic planning for that source.
+    """
+    if not source.exists():
+        return None, [f"source does not exist: {source}"]
+    if source.is_symlink():
+        return None, [f"source folder is a symlink: {source}"]
+    if not source.is_dir():
+        return None, [f"source is not a directory: {source}"]
+
+    videos: list[Path] = []
+    subtitles: list[Path] = []
+    blockers: list[str] = []
+
+    try:
+        entries = sorted(source.iterdir(), key=lambda item: item.name.casefold())
+    except OSError as exc:
+        return None, [f"cannot list source folder: {exc}"]
+
+    for path in entries:
+        name_folded = path.name.casefold()
+
+        if path.is_symlink():
+            blockers.append(f"symlink present: {path.name}")
+            continue
+
+        if path.is_dir():
+            if name_folded in SYSTEM_METADATA_DIRECTORY_NAMES:
+                continue
+            blockers.append(f"real subdirectory present: {path.name}")
+            continue
+
+        if name_folded in SYSTEM_METADATA_FILE_NAMES:
+            continue
+
+        suffix = path.suffix.casefold()
+        if suffix in VIDEO_EXTENSIONS:
+            videos.append(path)
+        elif suffix in SUBTITLE_EXTENSIONS:
+            subtitles.append(path)
+        elif suffix in GENERIC_SIDECAR_EXTENSIONS:
+            blockers.append(f"generic sidecar present: {path.name}")
+        else:
+            blockers.append(f"unrecognized file present: {path.name}")
+
+    if not videos:
+        blockers.append("no recognized video files")
+
+    if blockers:
+        return None, blockers
+
+    subtitle_to_video: dict[Path, Path] = {}
+    for subtitle in subtitles:
+        matches = [
+            video
+            for video in videos
+            if subtitle_matches_video(subtitle, video)
+        ]
+        if len(matches) != 1:
+            if not matches:
+                blockers.append(
+                    f"subtitle has no unambiguous video stem match: {subtitle.name}"
+                )
+            else:
+                names = ", ".join(video.name for video in matches)
+                blockers.append(
+                    f"subtitle matches multiple video stems: {subtitle.name} -> {names}"
+                )
+            continue
+        subtitle_to_video[subtitle] = matches[0]
+
+    if blockers:
+        return None, blockers
+
+    return {
+        "videos": videos,
+        "subtitles": subtitles,
+        "subtitle_to_video": subtitle_to_video,
+    }, []
+
+
+def available_video_bundle_targets(
+    target_dir: Path,
+    video: Path,
+    subtitles: list[Path],
+    reserved: set[Path],
+):
+    """Choose one suffix index that keeps a video and all its subtitles together."""
+    index = 0
+
+    while True:
+        if index == 0:
+            video_name = video.name
+            video_stem = video.stem
+        else:
+            video_name = f"{video.stem} ({index}){video.suffix}"
+            video_stem = f"{video.stem} ({index})"
+
+        video_target = target_dir / video_name
+        subtitle_targets: dict[Path, Path] = {}
+        candidates = [video_target]
+
+        for subtitle in subtitles:
+            subtitle_base = subtitle.name[:-len(subtitle.suffix)] if subtitle.suffix else subtitle.name
+            tail = subtitle_base[len(video.stem):] + subtitle.suffix
+            subtitle_target = target_dir / f"{video_stem}{tail}"
+            subtitle_targets[subtitle] = subtitle_target
+            candidates.append(subtitle_target)
+
+        if all(not path.exists() and path not in reserved for path in candidates):
+            return video_target, subtitle_targets
+
+        index += 1
+
+
+def plan_collision_merges(plans: list[FolderPlan]):
+    """Build exact M3b move plans without mutating the filesystem."""
+    destination_plans: dict[Path, list[FolderPlan]] = defaultdict(list)
+    for plan in plans:
+        destination_plans[plan.target].append(plan)
+
+    reports: list[str] = []
+    planned_moves = 0
+    blocked_sources = 0
+
+    for target in sorted(destination_plans, key=str):
+        group = destination_plans[target]
+        sources = sorted({plan.source for plan in group}, key=str)
+        if len(sources) <= 1:
+            continue
+
+        lines = [
+            f"[M3 PLAN] canonical target: {target}",
+            "  mode: plan only; --write cannot execute M3 moves",
+        ]
+
+        if not target.exists():
+            lines.append("  [M3 BLOCKED] canonical target does not exist yet")
+            blocked_sources += max(0, len(sources) - 1)
+            reports.append("\n".join(lines))
+            continue
+
+        if target.is_symlink() or not target.is_dir():
+            lines.append("  [M3 BLOCKED] canonical target is not a safe real directory")
+            blocked_sources += max(0, len(sources) - 1)
+            reports.append("\n".join(lines))
+            continue
+
+        if target not in sources:
+            lines.append(
+                "  [M3 BLOCKED] canonical target exists but is not one of the Plex source folders"
+            )
+            blocked_sources += len(sources)
+            reports.append("\n".join(lines))
+            continue
+
+        reserved: set[Path] = set()
+
+        for source in sources:
+            if source == target:
+                lines.append(f"  canonical source stays in place: {source}")
+                continue
+
+            classified, blockers = merge_source_files(source)
+            if blockers:
+                blocked_sources += 1
+                lines.append(f"  [M3 BLOCKED SOURCE] {source}")
+                for blocker in blockers:
+                    lines.append(f"    reason: {blocker}")
+                continue
+
+            videos: list[Path] = classified["videos"]
+            subtitle_to_video: dict[Path, Path] = classified["subtitle_to_video"]
+            subtitles_by_video: dict[Path, list[Path]] = defaultdict(list)
+            for subtitle, video in subtitle_to_video.items():
+                subtitles_by_video[video].append(subtitle)
+
+            source_moves: list[tuple[Path, Path]] = []
+            for video in sorted(videos, key=lambda item: item.name.casefold()):
+                associated_subtitles = sorted(
+                    subtitles_by_video.get(video, []),
+                    key=lambda item: item.name.casefold(),
+                )
+                video_target, subtitle_targets = available_video_bundle_targets(
+                    target,
+                    video,
+                    associated_subtitles,
+                    reserved,
+                )
+
+                source_moves.append((video, video_target))
+                reserved.add(video_target)
+
+                for subtitle in associated_subtitles:
+                    subtitle_target = subtitle_targets[subtitle]
+                    source_moves.append((subtitle, subtitle_target))
+                    reserved.add(subtitle_target)
+
+            lines.append(f"  [M3 SOURCE READY] {source}")
+            for source_path, target_path in source_moves:
+                lines.append(f"    [M3 MOVE] {source_path}")
+                lines.append(f"             -> {target_path}")
+                planned_moves += 1
+
+            lines.append(
+                "    source folder is intentionally left in place; no directory deletion is planned"
+            )
+
+        reports.append("\n".join(lines))
+
+    return reports, planned_moves, blocked_sources
+
+
 def validate_plans(
     plans: list[FolderPlan],
 ) -> tuple[list[FolderPlan], list[str], list[str], int]:
@@ -1001,6 +1231,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--plan-collisions",
+        action="store_true",
+        help=(
+            "M3b diagnostic: produce exact conservative merge move plans. "
+            "This mode never executes those moves and cannot be combined with --write."
+        ),
+    )
+    parser.add_argument(
         "--write",
         action="store_true",
         help="Actually apply folder renames and root-file moves. Without this flag nothing is changed.",
@@ -1011,9 +1249,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
 
-    if args.analyze_collisions and args.write:
+    if (args.analyze_collisions or args.plan_collisions) and args.write:
         print(
-            "[FATAL] --analyze-collisions is diagnostic-only and cannot be combined with --write.",
+            "[FATAL] M3 diagnostic modes cannot be combined with --write.",
             file=sys.stderr,
         )
         return 2
@@ -1096,6 +1334,10 @@ def main() -> int:
 
     actionable, validation_review, collision_reports, already_normalized = validate_plans(plans)
     m3_analysis_reports = analyze_collision_plans(plans) if args.analyze_collisions else []
+    if args.plan_collisions:
+        m3_plan_reports, m3_planned_moves, m3_blocked_sources = plan_collision_merges(plans)
+    else:
+        m3_plan_reports, m3_planned_moves, m3_blocked_sources = [], 0, 0
     actionable, suspicious = split_suspicious_plans(actionable, "M1")
     root_actionable, root_suspicious = split_suspicious_plans(root_file_plans, "M2")
     suspicious = suspicious + root_suspicious
@@ -1136,6 +1378,10 @@ def main() -> int:
         print(report)
 
     for report in m3_analysis_reports:
+        print()
+        print(report)
+
+    for report in m3_plan_reports:
         print()
         print(report)
 
@@ -1232,6 +1478,8 @@ def main() -> int:
     print(f"Needs review        : {len(review)}")
     print(f"Collision groups    : {len(collision_reports)}")
     print(f"M3 analyses         : {len(m3_analysis_reports)}")
+    print(f"M3 planned moves    : {m3_planned_moves}")
+    print(f"M3 blocked sources  : {m3_blocked_sources}")
     print(f"Errors              : {errors}")
     if rename_log_path is not None:
         print(f"Rename audit log    : {rename_log_path}")
