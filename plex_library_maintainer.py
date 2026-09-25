@@ -1524,6 +1524,18 @@ def build_collision_execution_plan(plans: list[FolderPlan], selector: str):
             if flatten_blockers:
                 raise ValueError(f"{source}: " + "; ".join(flatten_blockers))
 
+            subtitle_quarantine_targets = []
+            quarantine_root = quarantine_root_for_target(target)
+            for subtitle_dir, _ in removals:
+                quarantine_target = available_directory_target(
+                    quarantine_root / f"{target.name}__{subtitle_dir.name}",
+                    quarantine_reserved,
+                )
+                quarantine_reserved.add(quarantine_target)
+                subtitle_quarantine_targets.append(
+                    (subtitle_dir, quarantine_target)
+                )
+
             actions.append(
                 {
                     "source": source,
@@ -1533,6 +1545,7 @@ def build_collision_execution_plan(plans: list[FolderPlan], selector: str):
                         for source_path, target_path in flatten_moves
                     ],
                     "subtitle_dirs": [path for path, _ in removals],
+                    "subtitle_quarantine_targets": subtitle_quarantine_targets,
                     "leftovers": classified["leftovers"],
                     "quarantine_target": None,
                 }
@@ -1593,6 +1606,7 @@ def build_collision_execution_plan(plans: list[FolderPlan], selector: str):
                 "canonical": False,
                 "moves": moves,
                 "subtitle_dirs": sorted(subtitle_dirs, key=str),
+                "subtitle_quarantine_targets": [],
                 "leftovers": classified["leftovers"],
                 "quarantine_target": quarantine_target,
             }
@@ -1633,8 +1647,12 @@ def print_collision_execution_plan(execution) -> None:
         for subtitle_dir in action["subtitle_dirs"]:
             print(
                 f"  [M3 VERIFY SUBS] {subtitle_dir} "
-                "before removing it from the active library tree"
+                "after moving every planned subtitle"
             )
+
+        for subtitle_dir, quarantine_target in action["subtitle_quarantine_targets"]:
+            print(f"  [M3 QUARANTINE SUBS] {subtitle_dir}")
+            print(f"                       -> {quarantine_target}")
 
         for leftover in action["leftovers"]:
             print(f"  [M3 LEFTOVER] {leftover}")
@@ -1662,20 +1680,29 @@ def write_m3_audit(handle, run_id: str, status: str, source: Path, target: Path 
     handle.flush()
 
 
+def verify_drained_subtitle_directory(subtitle_dir: Path) -> None:
+    """Require a processed Subs/Subtitles directory to contain only system metadata."""
+    if not subtitle_dir.exists() or not subtitle_dir.is_dir() or subtitle_dir.is_symlink():
+        raise OSError(f"subtitle directory is no longer safe: {subtitle_dir}")
+
+    for entry in subtitle_dir.iterdir():
+        if entry.is_symlink():
+            raise OSError(f"symlink appeared in subtitle directory: {entry}")
+
+        folded = entry.name.casefold()
+        if entry.is_dir() and folded in SYSTEM_METADATA_DIRECTORY_NAMES:
+            continue
+        if entry.is_file() and folded in SYSTEM_METADATA_FILE_NAMES:
+            continue
+
+        raise OSError(f"unexpected content remains in subtitle directory: {entry}")
+
+
 def execute_collision_execution_plan(execution) -> int:
-    """Execute one preflighted collision. Subs/Subtitles writes remain fail-closed."""
+    """Execute one preflighted collision, including verified Subs/Subtitles handling."""
     target: Path = execution["target"]
     metadata_plan = execution["metadata_plan"]
     actions = execution["actions"]
-
-    for action in actions:
-        if action["subtitle_dirs"]:
-            print(
-                f"[FATAL] M3c write is not enabled yet for Subs/Subtitles: "
-                f"{action['subtitle_dirs'][0]}",
-                file=sys.stderr,
-            )
-            return 2
 
     frozen = {}
     try:
@@ -1723,9 +1750,6 @@ def execute_collision_execution_plan(execution) -> int:
                 return 1
 
         for action in actions:
-            if action["canonical"]:
-                continue
-
             action_failed = False
             for source_path, target_path, kind in action["moves"]:
                 try:
@@ -1779,8 +1803,88 @@ def execute_collision_execution_plan(execution) -> int:
             if action_failed:
                 break
 
+            try:
+                for subtitle_dir in action["subtitle_dirs"]:
+                    planned_subtitles = [
+                        (source_path, target_path)
+                        for source_path, target_path, kind in action["moves"]
+                        if kind == "SUBTITLE" and source_path.parent == subtitle_dir
+                    ]
+                    for source_path, target_path in planned_subtitles:
+                        if source_path.exists():
+                            raise OSError(
+                                f"subtitle still exists at source after move: {source_path}"
+                            )
+                        if not target_path.exists() or not target_path.is_file():
+                            raise OSError(
+                                f"moved subtitle is missing at destination: {target_path}"
+                            )
+                    verify_drained_subtitle_directory(subtitle_dir)
+                    print(f"[M3 VERIFIED SUBS] {subtitle_dir}")
+            except OSError as exc:
+                errors += 1
+                write_m3_audit(
+                    log_handle,
+                    run_id,
+                    "M3_ERROR",
+                    action["source"],
+                    None,
+                    metadata_plan,
+                )
+                print(f"[M3 ERROR] {exc}", file=sys.stderr)
+                break
+
+            for subtitle_dir, subtitle_quarantine in action["subtitle_quarantine_targets"]:
+                try:
+                    subtitle_quarantine.parent.mkdir(parents=True, exist_ok=True)
+                    if subtitle_quarantine.exists():
+                        raise OSError(
+                            f"refusing to overwrite subtitle quarantine target: "
+                            f"{subtitle_quarantine}"
+                        )
+                    verify_drained_subtitle_directory(subtitle_dir)
+                    os.rename(subtitle_dir, subtitle_quarantine)
+                    if subtitle_dir.exists() or not subtitle_quarantine.is_dir():
+                        raise OSError(
+                            f"subtitle quarantine verification failed: "
+                            f"{subtitle_quarantine}"
+                        )
+
+                    quarantined += 1
+                    write_m3_audit(
+                        log_handle,
+                        run_id,
+                        "M3_QUARANTINED_SUBTITLE_DIR",
+                        subtitle_dir,
+                        subtitle_quarantine,
+                        metadata_plan,
+                    )
+                    print(
+                        f"[M3 QUARANTINED SUBS] {subtitle_dir} "
+                        f"-> {subtitle_quarantine}"
+                    )
+                except OSError as exc:
+                    errors += 1
+                    action_failed = True
+                    write_m3_audit(
+                        log_handle,
+                        run_id,
+                        "M3_ERROR",
+                        subtitle_dir,
+                        subtitle_quarantine,
+                        metadata_plan,
+                    )
+                    print(f"[M3 ERROR] {exc}", file=sys.stderr)
+                    break
+
+            if action_failed:
+                break
+
             source = action["source"]
             quarantine_target = action["quarantine_target"]
+            if quarantine_target is None:
+                continue
+
             try:
                 quarantine_target.parent.mkdir(parents=True, exist_ok=True)
                 if quarantine_target.exists():
