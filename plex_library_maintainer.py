@@ -13,7 +13,9 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import unicodedata
 from datetime import datetime
@@ -25,6 +27,7 @@ from pathlib import Path
 LIBRARY_DB = "com.plexapp.plugins.library.db"
 DEFAULT_CONFIG = Path("config.json")
 SUSPICIOUS_SIMILARITY_THRESHOLD = 0.55
+DUPLICATE_DURATION_TOLERANCE_SECONDS = 5.0
 
 VIDEO_EXTENSIONS = {
     ".avi", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg",
@@ -2107,6 +2110,622 @@ def execute_collision_execution_plan(execution) -> int:
     return 1 if errors else 0
 
 
+
+def duplicate_movie_groups(
+    conn: sqlite3.Connection,
+    libraries: list[Library],
+    path_maps: list[tuple[str, str]],
+):
+    """Return Plex movie items that contain more than one media version."""
+    library_by_id = {library.id: library for library in libraries}
+    library_ids = list(library_by_id)
+    if not library_ids:
+        return []
+
+    placeholders = ",".join("?" for _ in library_ids)
+    rows = conn.execute(
+        f"""
+        SELECT
+            metadata.library_section_id,
+            metadata.id AS metadata_id,
+            metadata.title,
+            metadata.year,
+            media.id AS media_id,
+            parts.id AS part_id,
+            parts.file
+        FROM metadata_items AS metadata
+        INNER JOIN media_items AS media
+            ON media.metadata_item_id = metadata.id
+        INNER JOIN media_parts AS parts
+            ON parts.media_item_id = media.id
+        WHERE metadata.library_section_id IN ({placeholders})
+          AND metadata.metadata_type = 1
+        ORDER BY metadata.library_section_id, metadata.id, media.id, parts.id
+        """,
+        library_ids,
+    ).fetchall()
+
+    movies = {}
+    for row in rows:
+        library_id = int(row["library_section_id"])
+        metadata_id = int(row["metadata_id"])
+        key = (library_id, metadata_id)
+        group = movies.setdefault(
+            key,
+            {
+                "library": library_by_id[library_id],
+                "metadata_id": metadata_id,
+                "title": str(row["title"] or f"metadata {metadata_id}"),
+                "year": int(row["year"]) if row["year"] is not None else None,
+                "versions": {},
+            },
+        )
+
+        media_id = int(row["media_id"])
+        version = group["versions"].setdefault(
+            media_id,
+            {
+                "media_id": media_id,
+                "files": [],
+            },
+        )
+        path = apply_path_maps(row["file"], path_maps)
+        if path not in version["files"]:
+            version["files"].append(path)
+
+    groups = [
+        group
+        for group in movies.values()
+        if len(group["versions"]) > 1
+    ]
+    groups.sort(
+        key=lambda group: (
+            group["library"].name.casefold(),
+            group["title"].casefold(),
+            group["year"] if group["year"] is not None else -1,
+            group["metadata_id"],
+        )
+    )
+    return groups
+
+
+def human_size(value: int | None) -> str:
+    if value is None:
+        return "?"
+    size = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024.0 or unit == "TiB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024.0
+    return f"{size:.1f} TiB"
+
+
+def format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "?"
+    total = max(0, int(round(seconds)))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}"
+
+
+def probe_media_file(ffprobe: str, path: Path):
+    """Read technical media metadata with ffprobe without modifying the file."""
+    if not path.exists():
+        return {"path": path, "error": "file does not exist"}
+    if not path.is_file():
+        return {"path": path, "error": "path is not a regular file"}
+    if path.is_symlink():
+        return {"path": path, "error": "refusing to probe symlink"}
+
+    try:
+        completed = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"path": path, "error": str(exc)}
+
+    if completed.returncode != 0:
+        message = completed.stderr.strip() or f"ffprobe exited {completed.returncode}"
+        return {"path": path, "error": message}
+
+    try:
+        data = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        return {"path": path, "error": f"invalid ffprobe JSON: {exc}"}
+
+    format_info = data.get("format") or {}
+    streams = data.get("streams") or []
+    video_streams = [stream for stream in streams if stream.get("codec_type") == "video"]
+    audio_streams = [stream for stream in streams if stream.get("codec_type") == "audio"]
+    subtitle_streams = [
+        stream for stream in streams if stream.get("codec_type") == "subtitle"
+    ]
+
+    duration = None
+    raw_duration = format_info.get("duration")
+    if raw_duration not in (None, "", "N/A"):
+        try:
+            duration = float(raw_duration)
+        except (TypeError, ValueError):
+            pass
+
+    try:
+        size = int(format_info.get("size"))
+    except (TypeError, ValueError):
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = None
+
+    video = None
+    if video_streams:
+        stream = video_streams[0]
+        pix_fmt = str(stream.get("pix_fmt") or "")
+        bit_depth = None
+        for key in ("bits_per_raw_sample", "bits_per_sample"):
+            raw = stream.get(key)
+            if raw not in (None, "", "N/A", "0"):
+                try:
+                    bit_depth = int(raw)
+                    break
+                except (TypeError, ValueError):
+                    pass
+        if bit_depth is None:
+            match = re.search(r"p(10|12|16)(?:le|be)?$", pix_fmt.casefold())
+            if match:
+                bit_depth = int(match.group(1))
+            elif pix_fmt:
+                bit_depth = 8
+
+        transfer = str(stream.get("color_transfer") or "").casefold()
+        side_data = json.dumps(stream.get("side_data_list") or []).casefold()
+        if "dovi" in side_data or "dolby vision" in side_data:
+            hdr = "Dolby Vision"
+        elif transfer == "smpte2084":
+            hdr = "HDR/PQ"
+        elif transfer == "arib-std-b67":
+            hdr = "HLG"
+        else:
+            hdr = "SDR/unknown"
+
+        video = {
+            "codec": str(stream.get("codec_name") or "?"),
+            "profile": str(stream.get("profile") or ""),
+            "width": int(stream.get("width") or 0),
+            "height": int(stream.get("height") or 0),
+            "pix_fmt": pix_fmt,
+            "bit_depth": bit_depth,
+            "hdr": hdr,
+        }
+
+    audio = []
+    for stream in audio_streams:
+        tags = stream.get("tags") or {}
+        audio.append(
+            {
+                "language": str(tags.get("language") or "und").casefold(),
+                "codec": str(stream.get("codec_name") or "?").casefold(),
+                "channels": int(stream.get("channels") or 0),
+                "layout": str(stream.get("channel_layout") or ""),
+                "title": str(tags.get("title") or ""),
+            }
+        )
+
+    subtitles = []
+    for stream in subtitle_streams:
+        tags = stream.get("tags") or {}
+        disposition = stream.get("disposition") or {}
+        subtitles.append(
+            {
+                "language": str(tags.get("language") or "und").casefold(),
+                "codec": str(stream.get("codec_name") or "?").casefold(),
+                "forced": bool(disposition.get("forced")),
+                "hearing_impaired": bool(disposition.get("hearing_impaired")),
+                "title": str(tags.get("title") or ""),
+            }
+        )
+
+    return {
+        "path": path,
+        "error": None,
+        "size": size,
+        "duration": duration,
+        "video": video,
+        "audio": audio,
+        "subtitles": subtitles,
+    }
+
+
+def summarize_media_version(ffprobe: str, version):
+    probes = [probe_media_file(ffprobe, path) for path in version["files"]]
+    errors = [probe["error"] for probe in probes if probe.get("error")]
+    valid = [probe for probe in probes if not probe.get("error")]
+
+    total_size = None
+    if valid and all(probe.get("size") is not None for probe in valid):
+        total_size = sum(int(probe["size"]) for probe in valid)
+
+    duration = None
+    if valid and len(valid) == len(probes) and all(
+        probe.get("duration") is not None for probe in valid
+    ):
+        duration = sum(float(probe["duration"]) for probe in valid)
+
+    effective_bitrate = None
+    if total_size is not None and duration and duration > 0:
+        effective_bitrate = (total_size * 8.0) / duration
+
+    videos = [probe.get("video") for probe in valid if probe.get("video")]
+    video = videos[0] if videos else None
+    mixed_video = any(item != video for item in videos[1:]) if video else False
+
+    audio_signatures = {
+        (
+            stream["language"],
+            stream["codec"],
+            stream["channels"],
+        )
+        for probe in valid
+        for stream in probe.get("audio", [])
+    }
+    subtitle_signatures = {
+        (
+            stream["language"],
+            stream["codec"],
+            stream["forced"],
+            stream["hearing_impaired"],
+        )
+        for probe in valid
+        for stream in probe.get("subtitles", [])
+    }
+
+    return {
+        "media_id": version["media_id"],
+        "files": version["files"],
+        "probes": probes,
+        "errors": errors,
+        "multipart": len(version["files"]) > 1,
+        "size": total_size,
+        "duration": duration,
+        "effective_bitrate": effective_bitrate,
+        "video": video,
+        "mixed_video": mixed_video,
+        "audio_signatures": audio_signatures,
+        "subtitle_signatures": subtitle_signatures,
+    }
+
+
+def duration_clusters(versions):
+    """Group versions whose total durations are within a conservative tolerance."""
+    known = sorted(
+        [version for version in versions if version["duration"] is not None],
+        key=lambda version: version["duration"],
+    )
+    unknown = [version for version in versions if version["duration"] is None]
+
+    clusters = []
+    for version in known:
+        placed = False
+        for cluster in clusters:
+            values = [item["duration"] for item in cluster]
+            if (
+                max(max(values), version["duration"])
+                - min(min(values), version["duration"])
+                <= DUPLICATE_DURATION_TOLERANCE_SECONDS
+            ):
+                cluster.append(version)
+                placed = True
+                break
+        if not placed:
+            clusters.append([version])
+
+    clusters.extend([[version] for version in unknown])
+    return clusters
+
+
+def version_dominates(better, worse) -> bool:
+    """Return True only for a deliberately strict technical dominance case."""
+    if better["errors"] or worse["errors"]:
+        return False
+    if better["multipart"] or worse["multipart"]:
+        return False
+    if better["mixed_video"] or worse["mixed_video"]:
+        return False
+
+    better_video = better["video"]
+    worse_video = worse["video"]
+    if not better_video or not worse_video:
+        return False
+
+    if better_video["codec"] != worse_video["codec"]:
+        return False
+    if better_video["hdr"] != worse_video["hdr"]:
+        return False
+
+    better_pixels = better_video["width"] * better_video["height"]
+    worse_pixels = worse_video["width"] * worse_video["height"]
+    if not better_pixels or not worse_pixels or better_pixels < worse_pixels:
+        return False
+
+    better_depth = better_video["bit_depth"]
+    worse_depth = worse_video["bit_depth"]
+    if worse_depth is not None and (
+        better_depth is None or better_depth < worse_depth
+    ):
+        return False
+
+    better_rate = better["effective_bitrate"]
+    worse_rate = worse["effective_bitrate"]
+    if worse_rate is not None and (
+        better_rate is None or better_rate < worse_rate * 0.98
+    ):
+        return False
+
+    if not better["audio_signatures"].issuperset(worse["audio_signatures"]):
+        return False
+    if not better["subtitle_signatures"].issuperset(worse["subtitle_signatures"]):
+        return False
+
+    strict = (
+        better_pixels > worse_pixels
+        or (
+            better_rate is not None
+            and worse_rate is not None
+            and better_rate > worse_rate * 1.05
+        )
+        or (
+            better_depth is not None
+            and worse_depth is not None
+            and better_depth > worse_depth
+        )
+        or better["audio_signatures"] > worse["audio_signatures"]
+        or better["subtitle_signatures"] > worse["subtitle_signatures"]
+    )
+    return strict
+
+
+def classify_duration_cluster(cluster):
+    if len(cluster) == 1:
+        version = cluster[0]
+        if version["duration"] is None or version["errors"]:
+            return {version["media_id"]: "REVIEW"}
+        return {version["media_id"]: "DIFFERENT CUT"}
+
+    if any(
+        version["duration"] is None
+        or version["errors"]
+        or version["multipart"]
+        or version["mixed_video"]
+        for version in cluster
+    ):
+        return {version["media_id"]: "REVIEW" for version in cluster}
+
+    dominated = set()
+    for worse in cluster:
+        for better in cluster:
+            if better is worse:
+                continue
+            if version_dominates(better, worse):
+                dominated.add(worse["media_id"])
+                break
+
+    survivors = [
+        version for version in cluster if version["media_id"] not in dominated
+    ]
+    result = {
+        version["media_id"]: "DOMINATED"
+        for version in cluster
+        if version["media_id"] in dominated
+    }
+
+    survivor_label = "BEST CANDIDATE" if len(survivors) == 1 else "TRADE-OFF"
+    for version in survivors:
+        result[version["media_id"]] = survivor_label
+    return result
+
+
+def describe_video(version) -> str:
+    video = version["video"]
+    if not video:
+        return "video ?"
+
+    resolution = (
+        f"{video['width']}x{video['height']}"
+        if video["width"] and video["height"]
+        else "?"
+    )
+    depth = f"{video['bit_depth']}-bit" if video["bit_depth"] else "?-bit"
+    profile = f" {video['profile']}" if video["profile"] else ""
+    return (
+        f"{resolution} {video['codec']}{profile} "
+        f"{depth} {video['hdr']}"
+    )
+
+
+def describe_audio(version) -> str:
+    if not version["audio_signatures"]:
+        return "none"
+    items = []
+    for language, codec, channels in sorted(version["audio_signatures"]):
+        channel_text = f"{channels}ch" if channels else "?ch"
+        items.append(f"{language}:{codec}/{channel_text}")
+    return ", ".join(items)
+
+
+def describe_subtitles(version) -> str:
+    if not version["subtitle_signatures"]:
+        return "none"
+    items = []
+    for language, codec, forced, hearing_impaired in sorted(
+        version["subtitle_signatures"]
+    ):
+        flags = []
+        if forced:
+            flags.append("forced")
+        if hearing_impaired:
+            flags.append("HI")
+        suffix = f"/{'/'.join(flags)}" if flags else ""
+        items.append(f"{language}:{codec}{suffix}")
+    return ", ".join(items)
+
+
+def print_duplicate_report(
+    conn: sqlite3.Connection,
+    libraries: list[Library],
+    path_maps: list[tuple[str, str]],
+    probe_media: bool,
+) -> int:
+    groups = duplicate_movie_groups(conn, libraries, path_maps)
+    version_count = sum(len(group["versions"]) for group in groups)
+    file_count = sum(
+        len(version["files"])
+        for group in groups
+        for version in group["versions"].values()
+    )
+
+    print("PlexLibraryMaintainer M4 duplicate report")
+    print("=========================================")
+    print("Mode                : READ ONLY")
+    print(f"Duplicate movies    : {len(groups)}")
+    print(f"Media versions      : {version_count}")
+    print(f"Media files         : {file_count}")
+    print(f"Technical probe     : {'ffprobe' if probe_media else 'disabled'}")
+    if probe_media:
+        print(
+            f"Duration tolerance  : {DUPLICATE_DURATION_TOLERANCE_SECONDS:.0f}s "
+            "per same-cut cluster"
+        )
+    print()
+
+    if not groups:
+        print("No Plex movie items with multiple media versions were found.")
+        return 0
+
+    ffprobe = None
+    if probe_media:
+        ffprobe = shutil.which("ffprobe")
+        if ffprobe is None:
+            print(
+                "[FATAL] --probe-media requested but ffprobe is not available in PATH.",
+                file=sys.stderr,
+            )
+            return 2
+
+    probe_errors = 0
+
+    for group in groups:
+        title = display_title_year(group["title"], group["year"])
+        versions = [
+            group["versions"][media_id]
+            for media_id in sorted(group["versions"])
+        ]
+        print(f"[DUPLICATE] [{group['library'].name}] {title}")
+        print(
+            f"  Plex metadata id {group['metadata_id']} | "
+            f"{len(versions)} media versions"
+        )
+
+        if not probe_media:
+            for index, version in enumerate(versions, start=1):
+                print(f"  {index}. media id {version['media_id']}")
+                for path in version["files"]:
+                    try:
+                        size = path.stat().st_size if path.is_file() else None
+                    except OSError:
+                        size = None
+                    print(f"     {path}")
+                    print(f"       size: {human_size(size)}")
+            print()
+            continue
+
+        summaries = [summarize_media_version(ffprobe, version) for version in versions]
+        clusters = duration_clusters(summaries)
+        labels = {}
+        cluster_by_media_id = {}
+        for cluster_index, cluster in enumerate(clusters, start=1):
+            cluster_labels = classify_duration_cluster(cluster)
+            labels.update(cluster_labels)
+            for version in cluster:
+                cluster_by_media_id[version["media_id"]] = (
+                    cluster_index,
+                    "SAME CUT" if len(cluster) > 1 else (
+                        "REVIEW" if version["duration"] is None else "DIFFERENT CUT"
+                    ),
+                )
+
+        for index, version in enumerate(summaries, start=1):
+            cluster_index, cluster_label = cluster_by_media_id[version["media_id"]]
+            assessment = labels[version["media_id"]]
+            print(
+                f"  {index}. [{assessment}] media id {version['media_id']} "
+                f"| cluster {cluster_index} [{cluster_label}]"
+            )
+            for path in version["files"]:
+                print(f"     {path}")
+            print(
+                f"       size: {human_size(version['size'])} | "
+                f"duration: {format_duration(version['duration'])} | "
+                f"bitrate: "
+                + (
+                    f"{version['effective_bitrate'] / 1_000_000:.2f} Mbps"
+                    if version["effective_bitrate"] is not None
+                    else "?"
+                )
+            )
+            print(f"       video: {describe_video(version)}")
+            print(f"       audio: {describe_audio(version)}")
+            print(f"       subs : {describe_subtitles(version)}")
+            if version["multipart"]:
+                print(f"       note : MULTIPART ({len(version['files'])} files); auto-ranking disabled")
+            if version["mixed_video"]:
+                print("       note : mixed video characteristics across parts; auto-ranking disabled")
+            for error in version["errors"]:
+                probe_errors += 1
+                print(f"       [PROBE ERROR] {error}")
+
+        print("  Group assessment:")
+        for cluster_index, cluster in enumerate(clusters, start=1):
+            if len(cluster) > 1:
+                durations = [version["duration"] for version in cluster]
+                spread = max(durations) - min(durations)
+                print(
+                    f"    cluster {cluster_index}: SAME CUT by duration "
+                    f"({len(cluster)} versions, spread {spread:.2f}s)"
+                )
+            else:
+                version = cluster[0]
+                if version["duration"] is None:
+                    print(f"    cluster {cluster_index}: REVIEW (duration unavailable)")
+                else:
+                    print(
+                        f"    cluster {cluster_index}: DIFFERENT CUT candidate "
+                        f"({format_duration(version['duration'])})"
+                    )
+        print()
+
+    print("M4 duplicate summary")
+    print("====================")
+    print(f"Duplicate movies    : {len(groups)}")
+    print(f"Media versions      : {version_count}")
+    print(f"Probe errors        : {probe_errors}")
+    return 1 if probe_errors else 0
+
+
+
 def validate_plans(
     plans: list[FolderPlan],
 ) -> tuple[list[FolderPlan], list[str], list[str], int]:
@@ -2261,6 +2880,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--report",
+        choices=("duplicates",),
+        help=(
+            "Read-only M4 report. 'duplicates' lists Plex movie items that contain "
+            "multiple media versions."
+        ),
+    )
+    parser.add_argument(
+        "--probe-media",
+        action="store_true",
+        help=(
+            "With --report duplicates, inspect each duplicate version with ffprobe "
+            "and classify duration clusters and conservative technical dominance."
+        ),
+    )
+    parser.add_argument(
         "--write",
         action="store_true",
         help="Actually apply the selected write operation. Without this flag nothing is changed.",
@@ -2303,6 +2938,30 @@ def main() -> int:
 
     if args.merge_collision and not args.write:
         print("[FATAL] --merge-collision requires --write.", file=sys.stderr)
+        return 2
+
+    if args.report and args.write:
+        print("[FATAL] M4 reports are read-only and cannot use --write.", file=sys.stderr)
+        return 2
+
+    if args.probe_media and args.report != "duplicates":
+        print(
+            "[FATAL] --probe-media requires --report duplicates.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.report and (
+        args.analyze_collisions
+        or args.plan_collisions
+        or args.merge_collision
+        or args.merge_ready_collisions
+        or args.accept_title_mismatch
+    ):
+        print(
+            "[FATAL] M4 reports cannot be combined with M3 modes.",
+            file=sys.stderr,
+        )
         return 2
 
     try:
@@ -2369,6 +3028,14 @@ def main() -> int:
             for error in selection_errors:
                 print(f"[FATAL] {error}", file=sys.stderr)
             return 2
+
+        if args.report == "duplicates":
+            return print_duplicate_report(
+                conn,
+                libraries,
+                path_maps,
+                probe_media=args.probe_media,
+            )
 
         plans, root_file_plans, build_review, unsafe_names, build_skipped = build_plans(
             conn,
