@@ -33,6 +33,7 @@ VIDEO_EXTENSIONS = {
 SUBTITLE_EXTENSIONS = {".ass", ".idx", ".smi", ".srt", ".ssa", ".sub", ".sup", ".vtt"}
 GENERIC_SIDECAR_EXTENSIONS = {".jpg", ".jpeg", ".nfo", ".png", ".webp"}
 SUBTITLE_DIRECTORY_NAMES = {"subs", "subtitles"}
+PASSIVE_LEFTOVER_DIRECTORY_NAMES = {"cover-screens"}
 SYSTEM_METADATA_DIRECTORY_NAMES = {"@eadir"}
 SYSTEM_METADATA_FILE_NAMES = {".ds_store", "thumbs.db"}
 
@@ -943,6 +944,21 @@ def subtitle_tail_for_video(subtitle: Path, video: Path) -> str:
     return f".{subtitle_base}{subtitle.suffix}"
 
 
+def is_subtitle_directory_name(name: str) -> bool:
+    """Recognize conventional subtitle directories without guessing their contents."""
+    folded = name.casefold()
+    if folded in SUBTITLE_DIRECTORY_NAMES:
+        return True
+
+    return (
+        folded.endswith("]")
+        and (
+            folded.startswith("subtitles [")
+            or folded.startswith("subs [")
+        )
+    )
+
+
 def inspect_subtitle_directory(subtitle_dir: Path, video: Path):
     """Inspect a flat Subs/Subtitles directory for one unambiguous video.
 
@@ -1057,8 +1073,11 @@ def merge_source_files(source: Path):
         if path.is_dir():
             if name_folded in SYSTEM_METADATA_DIRECTORY_NAMES:
                 continue
-            if name_folded in SUBTITLE_DIRECTORY_NAMES:
+            if is_subtitle_directory_name(path.name):
                 subtitle_dirs.append(path)
+                continue
+            if name_folded in PASSIVE_LEFTOVER_DIRECTORY_NAMES:
+                leftovers.append(path)
                 continue
             blockers.append(f"real subdirectory present: {path.name}")
             continue
